@@ -1,153 +1,102 @@
-| Supported Targets | ESP32 | ESP32-C3 | ESP32-C6 | ESP32-H2 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | -------- |
+# AI Mirror
 
-# I2S ES8311 Example
+一个基于 **ESP32-S3** 的开源智能镜像硬件原型。项目将圆形显示屏上的眼睛动画与 ES8311 音频编解码器结合，提供本地音乐播放或麦克风回声两种演示模式；同时开源了固件与 PCB 制造资料。
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+> 当前仓库实现的是显示与音频基础原型，尚未包含联网、云端 AI 对话或语音识别功能。
 
-In this example, you can choose music mode or echo mode in menuconfig. In music mode, the example will play a piece of music in 'canon.pcm', and in echo mode, you can hear what you said in earphone.
+## 功能
 
-## ES8311 brief
+- 240 × 240 GC9A01 圆形 LCD，基于 LVGL 播放循环眼睛动画
+- ES8311 音频编解码器，16 kHz I2S 音频链路
+- 可在 ESP-IDF `menuconfig` 中选择：
+  - **音乐模式**：循环播放固件内置的 `canon.pcm`
+  - **回声模式**：将麦克风采集的声音实时输出到扬声器/耳机
+- 提供 PCB Gerber 与 BOM，便于打样和复现
 
-ES8311 low power mono audio codec features:
-
-- High performance and low power multi-bit delta-sigma audio ADC and DAC
-- I2S/PCM master or slave serial data port
-- I2C interface for configuration
-- ADC: 24-bit, 8 to 96 kHz sampling frequency
-- ADC: 100 dB signal to noise ratio, -93 dB THD+N
-- DAC: 24-bit, 8 to 96 kHz sampling frequency
-- DAC: 110 dB signal to noise ratio, -80 dB THD+N
-
-For more details, see [ES8311 datasheet](http://www.everest-semi.com/pdf/ES8311%20PB.pdf)
-
-## How to Use Example
-
-### Hardware Required
-
-* A development board with any supported Espressif SOC chip (see `Supported Targets` table above)
-    * The example can be preconfigured for [ESP-BOX](https://components.espressif.com/components/espressif/esp-box), [ESP32-S2-Kaluga-kit](https://components.espressif.com/components/espressif/esp32_s2_kaluga_kit) and [ESP32-S3-LCD-EV-board](https://components.espressif.com/components/espressif/esp32_s3_lcd_ev_board). More information is in 'Configure the Project' section.
-* A USB cable for power supply and programming.
-* A board with ES8311 codec, mic and earphone interface(e.g. ESP-LyraT-8311A extension board).
-
-### Connection
-```
-┌─────────────────┐           ┌──────────────────────────┐
-│       ESP       │           │          ES8311          │
-│                 │           │                          │
-│       I2S_MCK_IO├──────────►│PIN2-MCLK                 │
-│                 │           │                          │           ┌─────────┐
-│       I2S_BCK_IO├──────────►│PIN6-BCLK       PIN12-OUTP├───────────┤         │
-│                 │           │                          │           │ EARPHONE│
-│        I2S_WS_IO├──────────►│PIN8-LRCK       PIN13-OUTN├───────────┤         │
-│                 │           │                          │           └─────────┘
-│        I2S_DO_IO├──────────►│PIN9-SDIN                 │
-│                 │           │                          │
-│        I2S_DI_IO│◄──────────┤PIN7-SDOUT                │
-│                 │           │                          │           ┌─────────┐
-│                 │           │               PIN18-MIC1P├───────────┤         │
-│       I2C_SCL_IO├──────────►│PIN1 -CCLK                │           │  MIC    │
-│                 │           │               PIN17-MIC1N├───────────┤         │
-│       I2C_SDA_IO│◄─────────►│PIN19-CDATA               │           └─────────┘
-│                 │           │                          │
-│          VCC 3.3├───────────┤VCC                       │
-│                 │           │                          │
-│              GND├───────────┤GND                       │
-└─────────────────┘           └──────────────────────────┘
-```
-Note: Since ESP32-C3 & ESP32-H2 board does not have GPIO 16/17, you can use other available GPIOs instead. In this example, we set GPIO 6/7 as I2C pins for ESP32-C3 and GPIO 8/9 ESP32-H2 and GPIO 16/17 for other chips, same as GPIO 18/19, we use GPIO 2/3 instead.
-
-### Dependency
-
-This example is based on [es8311 component](https://components.espressif.com/component/espressif/es8311)
-
-The component can be installed by [IDF Component Manager](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/tools/idf-component-manager.html). This example already includes it. If you want to install [es8311 component](https://components.espressif.com/components/espressif/es8311) separately in your project, you can input the following command:
-```
-idf.py add-dependency "espressif/es8311^1.0.0"
-```
-
-If the dependency is added, you can check `idf_component.yml` for more detail. When building this example or other projects with managed components, the component manager will search for the required components online and download them into the `managed_components` folder.
-
-### Configure the Project
+## 仓库结构
 
 ```
+.
+├── Firmware/
+│   └── esp32_ai_mirror/       # ESP-IDF 固件工程
+│       ├── main/              # 应用、眼睛动画资源与音频示例
+│       └── sdkconfig          # 当前 ESP32-S3 配置
+└── PCB/
+    ├── Gerber_PCB1_*.zip      # PCB 制造文件
+    └── BOM_Board1_PCB1_*.xlsx # 物料清单
+```
+
+## 硬件概览
+
+默认固件配置面向 ESP32-S3，并使用以下外设：
+
+| 模块 | 接口 / 配置 |
+| --- | --- |
+| 主控 | ESP32-S3 |
+| 显示屏 | GC9A01，SPI，240 × 240 |
+| 显示引脚 | SCLK GPIO18、MOSI GPIO19、MISO GPIO21、DC GPIO5、RST GPIO3、CS GPIO4、背光 GPIO2 |
+| 音频编解码器 | ES8311，I2C + I2S |
+| ES8311 I2C | SCL GPIO9、SDA GPIO10 |
+| ES8311 I2S | MCLK GPIO6、BCLK GPIO7、WS GPIO8、DOUT GPIO11、DIN GPIO12 |
+
+引脚定义位于 [`Firmware/esp32_ai_mirror/main/example_config.h`](Firmware/esp32_ai_mirror/main/example_config.h) 与 [`Firmware/esp32_ai_mirror/main/i2s_es8311_example.c`](Firmware/esp32_ai_mirror/main/i2s_es8311_example.c)。若使用不同硬件，请先核对原理图和引脚分配再烧录。
+
+## 快速开始
+
+### 1. 准备环境
+
+安装与项目兼容的 ESP-IDF（组件清单要求 IDF 5.x），并在终端加载 ESP-IDF 环境。
+
+### 2. 构建
+
+```bash
+cd Firmware/esp32_ai_mirror
+idf.py set-target esp32s3
+idf.py build
+```
+
+首次构建时，ESP-IDF Component Manager 会根据 `main/idf_component.yml` 获取所需组件。
+
+### 3. 配置模式（可选）
+
+```bash
 idf.py menuconfig
 ```
-You can find configurations for this example in 'Example Configuration' tag.
 
-* In 'Example mode' subtag, you can set the example mode to 'music' or 'echo'. You can hear a piece of music in 'music' mode and echo the sound sampled by mic in 'echo' mode. You can also customize you own music to play as shown below.
+在 **Example Configuration** 中选择音乐或回声模式，并按需调整音量和回声模式的麦克风增益。
 
-* In 'Set MIC gain' subtag, you can set the mic gain for echo mode.
+### 4. 烧录与查看日志
 
-* In 'Voice volume', you can set the volume between 0 to 100.
+将 `PORT` 替换为开发板串口，例如 Windows 下的 `COM3`：
 
-* In 'Enable Board Support Package (BSP) support' you can enable support for BSP. You can pick specific BSP in [idf_component.yml](main/idf_component.yml).
-
-### Build and Flash
-
-Build the project and flash it to the board, then run monitor tool to view serial output:
-
-```
+```bash
 idf.py -p PORT flash monitor
 ```
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+按 `Ctrl-]` 退出串口监视器。
 
-See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
+## 自定义
 
-## Example Output
+### 替换眼睛动画
 
-Running this example in music mode, you can hear a piece of music (canon), the log is shown as follow:
+动画界面位于 [`Firmware/esp32_ai_mirror/main/lvgl_demo_ui.c`](Firmware/esp32_ai_mirror/main/lvgl_demo_ui.c)，当前由 `image.c` 中的四帧图片资源驱动。替换资源后，更新该文件中的帧数组即可。
 
-```
-I (348) I2S: DMA Malloc info, datalen=blocksize=1200, dma_desc_num=6
-I (348) I2S: DMA Malloc info, datalen=blocksize=1200, dma_desc_num=6
-I (358) I2S: I2S0, MCLK output by GPIO0
-I (368) DRV8311: ES8311 in Slave mode
-I (378) gpio: GPIO[10]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0
-I (3718) i2s_es8311: I2S music played, 213996 bytes are written.
-I (7948) i2s_es8311: I2S music played, 213996 bytes are written.
-......
-```
+### 替换音乐
 
-Running this example in echo mode, you can hear the sound in earphone that collected by mic.
-```
-I (312) I2S: DMA Malloc info, datalen=blocksize=1200, dma_desc_num=6
-I (312) I2S: DMA Malloc info, datalen=blocksize=1200, dma_desc_num=6
-I (322) I2S: I2S0, MCLK output by GPIO0
-I (332) DRV8311: ES8311 in Slave mode
-I (342) gpio: GPIO[10]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0
-```
+音乐模式将 `main/canon.pcm` 嵌入固件。请准备 16 kHz、16-bit PCM 音频，替换文件后保持 `main/CMakeLists.txt` 中的 `EMBED_FILES` 与源文件内的二进制符号名称一致。
 
-If you have a logic analyzer, you can use a logic analyzer to grab GPIO signal directly. The following table describes the pins we use by default (Note that you can also use other pins for the same purpose).
+## PCB 文件
 
-| pin name| function | gpio_num |
-|:---:|:---:|:---:|
-| MCLK  |module clock   | GPIO_NUM_0|
-| BCLK  |bit clock      | GPIO_NUM_4 |
-| WS    |word select    | GPIO_NUM_5 |
-| SDOUT |serial data out| GPIO_NUM_18/2 |
-| SDIN  |serial data in | GPIO_NUM_19/3 |
+`PCB/` 目录包含 Gerber 压缩包及 BOM。制造前请自行审核版本、层叠、阻抗和元件封装；这些文件按原样提供。
 
-### Customize your own music
+## 开发说明
 
-The example have contained a piece of music in canon.pcm, if you want to play your own music, you can follow these steps:
+- 主程序入口：[`Firmware/esp32_ai_mirror/main/i2s_es8311_example.c`](Firmware/esp32_ai_mirror/main/i2s_es8311_example.c)
+- 界面实现：[`Firmware/esp32_ai_mirror/main/lvgl_demo_ui.c`](Firmware/esp32_ai_mirror/main/lvgl_demo_ui.c)
+- 菜单配置：[`Firmware/esp32_ai_mirror/main/Kconfig.projbuild`](Firmware/esp32_ai_mirror/main/Kconfig.projbuild)
 
-1. Choose the music in any format you want to play (e.g. a.mp3)
-2. Install 'ffmpeg' tool
-3. Check your music format using ```ffprobe a.mp3```, you can get the stream format (e.g. Stream #0.0: Audio: mp3, 44100Hz, stereo, s16p, 64kb/s)
-4. Cut your music since there is no enough space for the whole piece of music. ```ffmpeg -i  a.mp3 -ss 00:00:00  -t  00:00:20  a_cut.mp3```
-5. Transfer the music format into .pcm. ```ffmpeg -i a_cut.mp3 -f s16ls -ar 16000 -ac -1 -acodec pcm_s16le a.pcm```
-6. Move 'a.pcm' under 'main' directory
-7. Replace 'canon.pcm' with 'a.pcm' in 'CMakeLists.txt' under 'main' directory
-8. Replace '_binary_canon_pcm_start' and '_binary_canon_pcm_end' with '_binary_a_pcm_start' and '_binary_a_pcm_end' in `i2s_es8311_example.c`
-9. Download the example and enjoy your own music
+欢迎提交 Issue 或 Pull Request 来改进硬件、界面和固件。
 
-## Troubleshooting
+## 许可证
 
-* Program upload failure
-
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-For any technical queries, please open an [issue](https://github.com/espressif/esp-idf/issues) on GitHub. We will get back to you soon.
+本仓库暂未提供许可证文件。在增加明确许可证前，请先联系项目维护者确认使用、修改与分发权限。

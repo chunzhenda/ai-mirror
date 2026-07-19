@@ -3,14 +3,14 @@ cmake_minimum_required(VERSION 3.16)
 
 if("${CONFIG}" STREQUAL "" OR "${CONFIG}" STREQUAL "")
   file(REMOVE_RECURSE
+  "ai_mirror.bin"
+  "ai_mirror.map"
   "bootloader\\bootloader.bin"
   "bootloader\\bootloader.elf"
   "bootloader\\bootloader.map"
   "canon.pcm.S"
   "config\\sdkconfig.cmake"
   "config\\sdkconfig.h"
-  "es8311test1.bin"
-  "es8311test1.map"
   "esp-idf\\esptool_py\\flasher_args.json.in"
   "esp-idf\\mbedtls\\x509_crt_bundle"
   "flash_app_args"

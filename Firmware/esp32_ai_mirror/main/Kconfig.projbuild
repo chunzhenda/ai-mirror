@@ -1,24 +1,24 @@
-menu "Example Configuration"
+menu "AI Mirror Configuration"
 
-    choice EXAMPLE_MODE
-        prompt "Example mode"
-        default EXAMPLE_MODE_MUSIC
+    choice AI_MIRROR_AUDIO_MODE
+        prompt "AI Mirror audio mode"
+        default AI_MIRROR_AUDIO_MODE_ECHO
         help
-            Select example work mode
+            Select the audio work mode used by the AI Mirror firmware.
 
-        config EXAMPLE_MODE_MUSIC
-            bool "music"
-        config EXAMPLE_MODE_ECHO
-            depends on !EXAMPLE_BSP
-            bool "echo"
+        config AI_MIRROR_AUDIO_MODE_MUSIC
+            bool "music playback"
+        config AI_MIRROR_AUDIO_MODE_ECHO
+            depends on !AI_MIRROR_BSP
+            bool "microphone echo test"
     endchoice
 
-    choice EXAMPLE_SELECT_MIC_GAIN
+    choice AI_MIRROR_SELECT_MIC_GAIN
         prompt "Set MIC gain"
-        depends on EXAMPLE_MODE_ECHO
+        depends on AI_MIRROR_AUDIO_MODE_ECHO
         default MIC_GAIN_18DB
         help
-            Select mic gain for echo mode
+            Select ES8311 microphone gain for echo/test mode.
 
         config MIC_GAIN_0DB
             bool "0dB"
@@ -38,7 +38,7 @@ menu "Example Configuration"
             bool "42dB"
     endchoice
 
-    config EXAMPLE_MIC_GAIN
+    config AI_MIRROR_MIC_GAIN
         int
         default 0 if MIC_GAIN_0DB
         default 1 if MIC_GAIN_6DB
@@ -49,16 +49,16 @@ menu "Example Configuration"
         default 6 if MIC_GAIN_36DB
         default 7 if MIC_GAIN_42DB
 
-    config EXAMPLE_VOICE_VOLUME
+    config AI_MIRROR_VOICE_VOLUME
         int "Voice volume"
         range 0 100
         default 60
         help
-            Set voice volume
+            Set ES8311 output volume.
 
-    config EXAMPLE_BSP
+    config AI_MIRROR_BSP
         bool "Enable Board Support Package (BSP) support"
         default n
         help
-            Use BSP to setup all hardware settings. Specific board must be selected in main/idf_component.yml file.
+            Use BSP to setup board hardware settings.
 endmenu

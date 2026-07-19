@@ -2,34 +2,34 @@
 	"sources" : 
 	[
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/CMakeFiles/bootloader"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/CMakeFiles/bootloader"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/CMakeFiles/bootloader.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/CMakeFiles/bootloader.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/CMakeFiles/bootloader-complete.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/CMakeFiles/bootloader-complete.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
 		},
 		{
-			"file" : "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+			"file" : "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
 		}
 	],
 	"target" : 

@@ -1,4 +1,4 @@
-# Install script for directory: D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/managed_components/espressif__es8311
+# Install script for directory: D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/managed_components/espressif__es8311
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -34,6 +34,6 @@ endif()
 
 # Set default install directory permissions.
 if(NOT DEFINED CMAKE_OBJDUMP)
-  set(CMAKE_OBJDUMP "E:/ESP-IDF/tools/tools/xtensa-esp32s3-elf/esp-12.2.0_20230208/xtensa-esp32s3-elf/bin/xtensa-esp32s3-elf-objdump.exe")
+  set(CMAKE_OBJDUMP "E:/TemporaryArea/62558/Espressif/tools/xtensa-esp32s3-elf/esp-12.2.0_20230208/xtensa-esp32s3-elf/bin/xtensa-esp32s3-elf-objdump.exe")
 endif()
 

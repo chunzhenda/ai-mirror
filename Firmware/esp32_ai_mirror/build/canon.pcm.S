@@ -1,4 +1,4 @@
-/* * Data converted from D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/main/canon.pcm
+/* * Data converted from D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/main/canon.pcm
  */
 .data
 .section .rodata.embedded

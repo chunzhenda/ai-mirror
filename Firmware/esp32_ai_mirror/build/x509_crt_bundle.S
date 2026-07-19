@@ -1,4 +1,4 @@
-/* * Data converted from D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/esp-idf/mbedtls/x509_crt_bundle
+/* * Data converted from D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/esp-idf/mbedtls/x509_crt_bundle
  */
 .data
 .section .rodata.embedded

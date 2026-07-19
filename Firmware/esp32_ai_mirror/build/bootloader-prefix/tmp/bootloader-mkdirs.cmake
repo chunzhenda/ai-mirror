@@ -4,19 +4,19 @@
 cmake_minimum_required(VERSION 3.5)
 
 file(MAKE_DIRECTORY
-  "E:/ESP-IDF/master/v5.1/esp-idf/components/bootloader/subproject"
-  "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader"
-  "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix"
-  "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/tmp"
-  "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp"
-  "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src"
-  "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp"
+  "E:/file/ESP-IDF/components/bootloader/subproject"
+  "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader"
+  "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix"
+  "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/tmp"
+  "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp"
+  "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src"
+  "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp"
 )
 
 set(configSubDirs )
 foreach(subDir IN LISTS configSubDirs)
-    file(MAKE_DIRECTORY "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/${subDir}")
+    file(MAKE_DIRECTORY "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp/${subDir}")
 endforeach()
 if(cfgdir)
-  file(MAKE_DIRECTORY "D:/my_project/ai_mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
+  file(MAKE_DIRECTORY "D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
 endif()

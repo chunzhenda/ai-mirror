@@ -1,7 +1,7 @@
 # WiFi 配网功能计划书 (SoftAP + Captive Portal)
 
 > 生成日期: 2026-07-13
-> 目标硬件: ESP32-S3 (项目 `es8311test1`, ESP-IDF 5.1.4)
+> 目标硬件: ESP32-S3 (项目 `ai_mirror`, ESP-IDF 5.1.4)
 > 配套文档: `小智项目分析.md`
 > 状态: 计划阶段（未动代码）
 > 性质: 本文档仅为规划，**不修改任何现有代码**。
@@ -93,9 +93,9 @@
 | `main/wifi_creds.h/c` | NVS 凭据读写封装：`creds_load()` / `creds_save()` / `creds_erase()` | 规划 |
 | `main/dns_server.c` | 迷你 DNS 重定向（UDP:53 → 192.168.4.1） | 规划 |
 | `main/config.html` | 配网页面（响应式表单 + 扫码列表 JS） | 规划 |
-| `main/i2s_es8311_example.c` | **改动点**：在 `app_main` 开头插入网络初始化阶段；配网模式下显示提示 UI | 现有，待改 |
+| `main/ai_mirror_main.c` | **改动点**：在 `app_main` 开头插入网络初始化阶段；配网模式下显示提示 UI | 现有，待改 |
 | `main/CMakeLists.txt` | **改动点**：`SRCS` 增加 `app_wifi.c` 等；`EMBED_FILES` 增加 `config.html`；`REQUIRES` 增加 `esp_wifi esp_http_server nvs_flash esp_event esp_netif json` | 现有，待改 |
-| `main/example_config.h` | 增加配网相关宏（AP 名前缀、STA 超时、AP 密码开关等） | 现有，待改 |
+| `main/ai_mirror_config.h` | 增加配网相关宏（AP 名前缀、STA 超时、AP 密码开关等） | 现有，待改 |
 | `main/Kconfig.projbuild` | 增加菜单项：AP SSID 前缀、STA 连接超时、是否开放 AP、配网服务端口 | 现有，待改 |
 
 ---
@@ -216,7 +216,7 @@ endmenu
 | **P0 基础设施** | 0.1 | NVS 初始化 + 事件循环 + netif + wifi 驱动 | `app_wifi.c`, `wifi_creds.c` | 1.5h |
 | | 0.2 | NVS 凭据读写封装 + 单元自测 | `wifi_creds.c` | 1h |
 | **P1 STA 连接** | 1.1 | STA 模式 + 事件处理 + 阻塞等待 IP | `app_wifi.c` | 2h |
-| | 1.2 | 接入 app_main：有凭据则联网，成功后跑主程序 | `i2s_es8311_example.c` | 1h |
+| | 1.2 | 接入 app_main：有凭据则联网，成功后跑主程序 | `ai_mirror_main.c` | 1h |
 | | 1.3 | 测试：硬编码凭据验证联网+主程序正常 | — | 0.5h |
 | **P2 配网门户** | 2.1 | SoftAP 启动 + netif ap + DHCP | `app_wifi_prov.c` | 1h |
 | | 2.2 | 迷你 DNS 重定向 server | `dns_server.c` | 1.5h |
@@ -262,7 +262,7 @@ endmenu
 
 ## 十、后续项目建议
 
-> 当前项目本质是 ESP-IDF `i2s_es8311` 例程 + GC9A01/LVGL 眼图，目标是"AI 镜/小智语音助手"。配网是通往一切网络能力的第一步。以下给出后续可选方向与建议，供定方向时参考。
+> 当前项目本质是 ESP-IDF `ai_mirror` 例程 + GC9A01/LVGL 眼图，目标是"AI 镜/小智语音助手"。配网是通往一切网络能力的第一步。以下给出后续可选方向与建议，供定方向时参考。
 
 ### 10.1 推荐主线（承接 `小智项目分析.md`）
 配网落地后，按该文档的 5 阶段推进最稳妥：
@@ -287,7 +287,7 @@ endmenu
 ### 10.4 近期可立即并行的小改进（不阻塞配网）
 - 开启 PSRAM（`sdkconfig` 当前未开），为后续音频缓冲/Opus 预留空间。
 - 把 `app_main` 的音频/显示初始化抽成 `app_audio_init()` / `app_display_init()`，为多模块解耦做准备（`小智项目分析.md` 已规划该文件结构）。
-- 为 `example_config.h` 的引脚补注释与版本号，便于换板维护。
+- 为 `ai_mirror_config.h` 的引脚补注释与版本号，便于换板维护。
 
 ---
 
@@ -295,5 +295,5 @@ endmenu
 
 - 本计划书 `WiFi配网功能计划书.md`
 - （后续实施时）`app_wifi.*`、`app_wifi_prov.*`、`wifi_creds.*`、`dns_server.c`、`config.html`
-- 改动后的 `i2s_es8311_example.c`、`CMakeLists.txt`、`Kconfig.projbuild`、`example_config.h`
+- 改动后的 `ai_mirror_main.c`、`CMakeLists.txt`、`Kconfig.projbuild`、`ai_mirror_config.h`
 - 真机端到端演示录像/截图（首次配网、换网、断网回退）

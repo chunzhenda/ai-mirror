@@ -73,7 +73,7 @@ If the dependency is added, you can check `idf_component.yml` for more detail. W
 ```
 idf.py menuconfig
 ```
-You can find configurations for this example in 'Example Configuration' tag.
+You can find configurations for this example in 'AI Mirror Configuration' tag.
 
 * In 'Example mode' subtag, you can set the example mode to 'music' or 'echo'. You can hear a piece of music in 'music' mode and echo the sound sampled by mic in 'echo' mode. You can also customize you own music to play as shown below.
 
@@ -105,8 +105,8 @@ I (348) I2S: DMA Malloc info, datalen=blocksize=1200, dma_desc_num=6
 I (358) I2S: I2S0, MCLK output by GPIO0
 I (368) DRV8311: ES8311 in Slave mode
 I (378) gpio: GPIO[10]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0
-I (3718) i2s_es8311: I2S music played, 213996 bytes are written.
-I (7948) i2s_es8311: I2S music played, 213996 bytes are written.
+I (3718) ai_mirror: I2S music played, 213996 bytes are written.
+I (7948) ai_mirror: I2S music played, 213996 bytes are written.
 ......
 ```
 
@@ -140,7 +140,7 @@ The example have contained a piece of music in canon.pcm, if you want to play yo
 5. Transfer the music format into .pcm. ```ffmpeg -i a_cut.mp3 -f s16ls -ar 16000 -ac -1 -acodec pcm_s16le a.pcm```
 6. Move 'a.pcm' under 'main' directory
 7. Replace 'canon.pcm' with 'a.pcm' in 'CMakeLists.txt' under 'main' directory
-8. Replace '_binary_canon_pcm_start' and '_binary_canon_pcm_end' with '_binary_a_pcm_start' and '_binary_a_pcm_end' in `i2s_es8311_example.c`
+8. Replace '_binary_canon_pcm_start' and '_binary_canon_pcm_end' with '_binary_a_pcm_start' and '_binary_a_pcm_end' in `ai_mirror_main.c`
 9. Download the example and enjoy your own music
 
 ## Troubleshooting

@@ -229,8 +229,8 @@ static void rgb_rainbow_task(void *arg)
         hsv_to_rgb(hue, 255, 32, &red, &green, &blue);
         ESP_ERROR_CHECK_WITHOUT_ABORT(board_rgb_set_rgb(red, green, blue));
 
-        hue = (hue + 1) % 360;
-        vTaskDelay(pdMS_TO_TICKS(20));
+        hue = (hue + 2) % 360;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 

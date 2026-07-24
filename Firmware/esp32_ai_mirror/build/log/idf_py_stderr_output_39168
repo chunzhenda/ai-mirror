@@ -1,0 +1,28 @@
+CMake Error at E:/file/ESP-IDF/tools/cmake/build.cmake:540 (message):
+  ERROR: Some components (espressif/esp-sr) in the "managed_components"
+  directory were modified on the disk since the last run of the CMake.
+  Content of this directory is managed automatically.
+
+  If you want to keep the changes, you can move the directory with the
+  component to the "components"directory of your project.
+
+  I.E.  for "espressif__esp-sr" run:
+
+  mv
+  D:\UGit\ai-mirror\Firmware\esp32_ai_mirror\managed_components\espressif__esp-sr
+  D:\UGit\ai-mirror\Firmware\esp32_ai_mirror\components\espressif__esp-sr
+
+  Or, if you want to discard the changes remove the ".component_hash" file
+  from the component's directory.
+
+  I.E.  for "espressif__esp-sr" run:
+
+  rm
+  D:\UGit\ai-mirror\Firmware\esp32_ai_mirror\managed_components\espressif__esp-sr\.component_hash
+
+
+Call Stack (most recent call first):
+  E:/file/ESP-IDF/tools/cmake/project.cmake:547 (idf_build_process)
+  CMakeLists.txt:6 (project)
+
+

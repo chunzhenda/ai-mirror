@@ -16,6 +16,9 @@
 #include "driver/i2s_std.h"
 #include "esp_system.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "esp_aec.h"
+#include <math.h>
 #include "es8311.h"
 #include "ai_mirror_config.h"
 #include "esp_timer.h"
@@ -65,9 +68,9 @@ extern void ai_mirror_ui_show_internet_warning(lv_disp_t *disp, bool retry_selec
  *  Audio section (unchanged from original)
  * ================================================================ */
 static const char *TAG = "ai_mirror";
-static const char err_reason[][30] = {"input param is invalid",
-                                      "operation timeout"
-                                     };
+#if CONFIG_AI_MIRROR_AUDIO_MODE_MUSIC
+static const char err_reason[][30] = {"input param is invalid", "operation timeout"};
+#endif
 static i2s_chan_handle_t tx_handle = NULL;
 static i2s_chan_handle_t rx_handle = NULL;
 
@@ -194,35 +197,186 @@ static void i2s_music(void *args)
 }
 
 #else
-static void i2s_echo(void *args)
+/* ----------------------------------------------------------------
+ * AEC (Acoustic Echo Cancellation) demo mode.
+ *
+ * A continuous 330 Hz reference tone is played to the speaker (the
+ * "far-end" signal that the microphone picks up as echo). The mic
+ * signal and the reference are fed to the esp-sr AEC so the tone is
+ * removed, leaving only near-end voice. Hold BTN1 to record the
+ * AEC-cleaned audio; ~2 s after release it is played back - you
+ * should hear your voice with the tone suppressed, proving echo
+ * cancellation is working.
+ * ---------------------------------------------------------------- */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define AEC_FRAME_MS            16
+#define AEC_FRAME_SAMPLES       (AI_MIRROR_SAMPLE_RATE * AEC_FRAME_MS / 1000)
+#define AEC_STEREO_SAMPLES      (AEC_FRAME_SAMPLES * 2)
+#define AEC_FRAME_BYTES         (AEC_STEREO_SAMPLES * sizeof(int16_t))
+#define AEC_REC_MAX_SECONDS     8
+#define AEC_REC_BUF_SAMPLES     (AI_MIRROR_SAMPLE_RATE * AEC_REC_MAX_SECONDS)
+#define AEC_PLAYBACK_DELAY_MS   2000
+#define AEC_TONE_AMPLITUDE      5000
+#define AEC_TONE_FREQ           330
+
+static inline uint32_t aec_mean_abs(const int16_t *data, int n)
 {
-    int *mic_data = malloc(AI_MIRROR_RECV_BUF_SIZE);
-    if (!mic_data) {
-        ESP_LOGE(TAG, "[echo] No memory for read data buffer");
-        abort();
+    uint32_t acc = 0;
+    for (int i = 0; i < n; i++) {
+        int16_t v = data[i];
+        acc += (v < 0) ? (uint32_t)(-v) : (uint32_t)v;
     }
-    esp_err_t ret = ESP_OK;
-    size_t bytes_read = 0;
-    size_t bytes_write = 0;
-    ESP_LOGI(TAG, "[echo] Echo start");
+    return acc / n;
+}
+
+static void i2s_aec_demo(void *args)
+{
+    aec_handle_t aec = aec_pro_create(AEC_FRAME_MS, 1, 5);
+    if (!aec) {
+        ESP_LOGE(TAG, "[aec] aec_pro_create failed, abort task");
+        vTaskDelete(NULL);
+    }
+    ESP_LOGI(TAG, "[aec] AEC created (mode 5, %dms frame)", AEC_FRAME_MS);
+
+    int16_t *mic_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
+    int16_t *ref_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
+    int16_t *mic_mono = heap_caps_malloc(AEC_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *ref_mono = heap_caps_malloc(AEC_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *out_mono = heap_caps_malloc(AEC_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *play_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
+    int16_t *rec_buf = heap_caps_malloc(AEC_REC_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+
+    if (!mic_ster || !ref_ster || !mic_mono || !ref_mono || !out_mono || !play_ster || !rec_buf) {
+        ESP_LOGE(TAG, "[aec] no PSRAM for buffers, abort task");
+        vTaskDelete(NULL);
+    }
+
+    ESP_LOGI(TAG, "[aec] demo ready: hold BTN1 to record (speaker silent, AEC active); release -> ~2s -> normalized playback");
+
+
+    int state = 0; /* 0=IDLE, 1=REC, 2=WAIT(2s), 3=PLAY */
+    size_t rec_samples = 0;
+    uint32_t frame_cnt = 0;
+    uint32_t idle_cnt = 0;
+    float play_gain = 1.0f;
+    int64_t wait_start_us = 0;
 
     while (1) {
-        memset(mic_data, 0, AI_MIRROR_RECV_BUF_SIZE);
-        ret = i2s_channel_read(rx_handle, mic_data, AI_MIRROR_RECV_BUF_SIZE, &bytes_read, 1000);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "[echo] i2s read failed, %s", err_reason[ret == ESP_ERR_TIMEOUT]);
-            abort();
+        /* ---- PLAYBACK: play peak-normalized recording, then go idle ---- */
+        if (state == 3) {
+            ESP_LOGI(TAG, "[aec] playback start, %u samples (%u ms) gain=x%.2f",
+                     (unsigned)rec_samples,
+                     (unsigned)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE),
+                     (double)play_gain);
+            size_t played = 0;
+            while (played < rec_samples) {
+                size_t n = AEC_FRAME_SAMPLES;
+                if (played + n > rec_samples) {
+                    n = rec_samples - played;
+                }
+                for (size_t j = 0; j < n; j++) {
+                    float fv = (float)rec_buf[played + j] * play_gain;
+                    if (fv > 32767.0f) {
+                        fv = 32767.0f;
+                    }
+                    if (fv < -32768.0f) {
+                        fv = -32768.0f;
+                    }
+                    int16_t sv = (int16_t)fv;
+                    play_ster[2 * j] = sv;
+                    play_ster[2 * j + 1] = sv;
+                }
+                size_t bw = 0;
+                esp_err_t ret = i2s_channel_write(tx_handle, play_ster, n * 2 * sizeof(int16_t),
+                                                  &bw, 1000);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "[aec] playback write failed: %s", esp_err_to_name(ret));
+                    break;
+                }
+                played += n;
+            }
+            ESP_LOGI(TAG, "[aec] playback done, %u samples", (unsigned)played);
+            state = 0;
+            idle_cnt = 0;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
-        ret = i2s_channel_write(tx_handle, mic_data, AI_MIRROR_RECV_BUF_SIZE, &bytes_write, 1000);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "[echo] i2s write failed, %s", err_reason[ret == ESP_ERR_TIMEOUT]);
-            abort();
+
+        /* ---- IDLE / REC / WAIT: keep I2S serviced; speaker stays SILENT (no reference tone) ---- */
+        memset(ref_mono, 0, AEC_FRAME_SAMPLES * sizeof(int16_t));
+        memset(ref_ster, 0, AEC_FRAME_BYTES);
+
+        size_t bw = 0, br = 0;
+        esp_err_t wret = i2s_channel_write(tx_handle, ref_ster, AEC_FRAME_BYTES, &bw, 1000);
+        if (wret != ESP_OK) {
+            ESP_LOGE(TAG, "[aec] tx write failed: %s", esp_err_to_name(wret));
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
         }
-        if (bytes_read != bytes_write) {
-            ESP_LOGW(TAG, "[echo] %d bytes read but only %d bytes are written", bytes_read, bytes_write);
+        esp_err_t rret = i2s_channel_read(rx_handle, mic_ster, AEC_FRAME_BYTES, &br, 1000);
+        if (rret != ESP_OK) {
+            ESP_LOGE(TAG, "[aec] rx read failed: %s", esp_err_to_name(rret));
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        for (int j = 0; j < AEC_FRAME_SAMPLES; j++) {
+            mic_mono[j] = mic_ster[2 * j];
+        }
+
+        if (state == 1) { /* REC: run AEC + store cleaned audio */
+            aec_process(aec, mic_mono, ref_mono, out_mono);
+            size_t room = AEC_REC_BUF_SAMPLES - rec_samples;
+            size_t n = (AEC_FRAME_SAMPLES < room) ? AEC_FRAME_SAMPLES : room;
+            memcpy(rec_buf + rec_samples, mic_mono, n * sizeof(int16_t));
+            rec_samples += n;
+
+            if ((frame_cnt % 31) == 0) {
+                uint32_t mic_lvl = aec_mean_abs(mic_mono, AEC_FRAME_SAMPLES);
+                uint32_t out_lvl = aec_mean_abs(out_mono, AEC_FRAME_SAMPLES);
+                ESP_LOGI(TAG, "[aec] lvl mic=%u out=%u (REC)", (unsigned)mic_lvl, (unsigned)out_lvl);
+            }
+            frame_cnt++;
+
+            if (!board_button_is_pressed(BOARD_BUTTON_ID_1) || rec_samples >= AEC_REC_BUF_SAMPLES) {
+                ESP_LOGI(TAG, "[aec] recording stop, %u samples (%u ms)",
+                         (unsigned)rec_samples,
+                         (unsigned)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE));
+                int32_t peak = 1;
+                for (size_t k = 0; k < rec_samples; k++) {
+                    int32_t v = rec_buf[k];
+                    int32_t a = (v < 0) ? -v : v;
+                    if (a > peak) {
+                        peak = a;
+                    }
+                }
+                play_gain = 24000.0f / (float)peak;
+                if (play_gain > 8.0f) {
+                    play_gain = 8.0f;
+                }
+                ESP_LOGI(TAG, "[aec] peak=%d gain=x%.2f", (int)peak, (double)play_gain);
+                wait_start_us = esp_timer_get_time();
+                state = 2;
+            }
+        } else if (state == 0) { /* IDLE: silent, wait for BTN1 */
+            idle_cnt++;
+            if ((idle_cnt % 375) == 0) {
+                ESP_LOGI(TAG, "[aec] idle (silent), ready - hold BTN1 to record");
+            }
+            if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
+                state = 1;
+                rec_samples = 0;
+                frame_cnt = 0;
+                ESP_LOGI(TAG, "[aec] recording start (AEC, speaker silent)");
+            }
+        } else if (state == 2) { /* WAIT ~2s (silent, I2S kept healthy) */
+            if ((esp_timer_get_time() - wait_start_us) >= 2000000) {
+                state = 3;
+            }
         }
     }
-    vTaskDelete(NULL);
 }
 #endif
 
@@ -469,10 +623,10 @@ static void ai_mirror_audio_start(bool audio_ok)
     }
 #else
     if (audio_ok) {
-        ESP_LOGI(TAG, "Start echo mode");
-        xTaskCreate(i2s_echo, "i2s_echo", 8192, NULL, 5, NULL);
+        ESP_LOGI(TAG, "Start AEC demo");
+        xTaskCreate(i2s_aec_demo, "aec_demo", 12288, NULL, 5, NULL);
     } else {
-        ESP_LOGW(TAG, "Audio disabled, echo task not started");
+        ESP_LOGW(TAG, "Audio disabled, AEC task not started");
     }
 #endif
 }

@@ -160,7 +160,7 @@ CMAKE_INSTALL_MANDIR:PATH=
 CMAKE_INSTALL_OLDINCLUDEDIR:PATH=/usr/include
 
 //Install path prefix, prepended onto install directories.
-CMAKE_INSTALL_PREFIX:PATH=C:/Program Files (x86)/es8311test1
+CMAKE_INSTALL_PREFIX:PATH=C:/Program Files (x86)/ai_mirror
 
 //Run-time variable data (LOCALSTATEDIR/run)
 CMAKE_INSTALL_RUNSTATEDIR:PATH=
@@ -359,15 +359,6 @@ ai_mirror_IS_TOP_LEVEL:STATIC=ON
 ai_mirror_SOURCE_DIR:STATIC=D:/UGit/ai-mirror/Firmware/esp32_ai_mirror
 
 //Value Computed by CMake
-es8311test1_BINARY_DIR:STATIC=D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build
-
-//Value Computed by CMake
-es8311test1_IS_TOP_LEVEL:STATIC=ON
-
-//Value Computed by CMake
-es8311test1_SOURCE_DIR:STATIC=D:/UGit/ai-mirror/Firmware/esp32_ai_mirror
-
-//Value Computed by CMake
 esp-idf_BINARY_DIR:STATIC=D:/UGit/ai-mirror/Firmware/esp32_ai_mirror/build/esp-idf
 
 //Value Computed by CMake
@@ -537,7 +528,7 @@ CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_NM
 CMAKE_NM-ADVANCED:INTERNAL=1
 //number of local generators
-CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=96
+CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=98
 //ADVANCED property for variable: CMAKE_OBJCOPY
 CMAKE_OBJCOPY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_OBJDUMP
@@ -597,7 +588,7 @@ HAVE_TIME_T_SIZE:INTERNAL=TRUE
 //CHECK_TYPE_SIZE: sizeof(time_t)
 TIME_T_SIZE:INTERNAL=8
 //CMAKE_INSTALL_PREFIX during last run
-_GNUInstallDirs_LAST_CMAKE_INSTALL_PREFIX:INTERNAL=C:/Program Files (x86)/es8311test1
+_GNUInstallDirs_LAST_CMAKE_INSTALL_PREFIX:INTERNAL=C:/Program Files (x86)/ai_mirror
 _Python3_EXECUTABLE:INTERNAL=E:/TemporaryArea/62558/Espressif/python_env/idf5.1_py3.11_env/Scripts/python.exe
 //Python3 Properties
 _Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;11;2;32;;;E:\TemporaryArea\62558\Espressif\tools\idf-python\3.11.2\Lib;E:\TemporaryArea\62558\Espressif\tools\idf-python\3.11.2\Lib;E:\TemporaryArea\62558\Espressif\python_env\idf5.1_py3.11_env\Lib\site-packages;E:\TemporaryArea\62558\Espressif\python_env\idf5.1_py3.11_env\Lib\site-packages

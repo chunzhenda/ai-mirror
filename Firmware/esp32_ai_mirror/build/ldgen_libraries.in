@@ -72,4 +72,6 @@ $<TARGET_FILE:__idf_espressif__esp_lcd_touch>
 $<TARGET_FILE:__idf_espressif__esp_lcd_touch_tt21100>
 $<TARGET_FILE:__idf_espressif__esp-box>
 $<TARGET_FILE:__idf_main>
+$<TARGET_FILE:__idf_espressif__esp-dsp>
+$<TARGET_FILE:__idf_espressif__esp-sr>
 $<TARGET_FILE:__idf_espressif__esp_lcd_gc9a01>

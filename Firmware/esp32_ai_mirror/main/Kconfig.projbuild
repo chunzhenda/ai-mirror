@@ -16,7 +16,7 @@ menu "AI Mirror Configuration"
     choice AI_MIRROR_SELECT_MIC_GAIN
         prompt "Set MIC gain"
         depends on AI_MIRROR_AUDIO_MODE_ECHO
-        default MIC_GAIN_24DB
+        default MIC_GAIN_18DB
         help
             Select ES8311 microphone gain for echo/test mode.
 
@@ -52,7 +52,7 @@ menu "AI Mirror Configuration"
     config AI_MIRROR_VOICE_VOLUME
         int "Voice volume"
         range 0 100
-        default 75
+        default 72
         help
             Set ES8311 output volume.
 

@@ -1,0 +1,17 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: network-chat
+nodes_managed: true
+exported_at: "2026-07-25T04:14:00Z"
+modules:
+    "":
+        dir_name: AI 智能魔镜项目总览与文档
+        title: AI 智能魔镜项目总览与文档
+        scope:
+            - README.md
+            - README_en.md
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

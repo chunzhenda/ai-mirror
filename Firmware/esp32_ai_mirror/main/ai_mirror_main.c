@@ -200,13 +200,13 @@ static void i2s_music(void *args)
 /* ----------------------------------------------------------------
  * AEC (Acoustic Echo Cancellation) demo mode.
  *
- * A continuous 330 Hz reference tone is played to the speaker (the
- * "far-end" signal that the microphone picks up as echo). The mic
- * signal and the reference are fed to the esp-sr AEC so the tone is
- * removed, leaving only near-end voice. Hold BTN1 to record the
- * AEC-cleaned audio; ~2 s after release it is played back - you
- * should hear your voice with the tone suppressed, proving echo
- * cancellation is working.
+ * The speaker stays silent during recording (no far-end reference), so
+ * AEC runs with a zero reference and just passes the cleaned mic signal
+ * through. Hold BTN1 to record; a short bell-like chime is played on press
+ * and on release as feedback. ~2 s after release the peak-normalized
+ * recording is played back so you can hear the captured voice. Pressing
+ * BTN1 during the pre-playback wait or during playback aborts it instantly,
+ * drops that recording and goes straight back to recording.
  * ---------------------------------------------------------------- */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -219,8 +219,36 @@ static void i2s_music(void *args)
 #define AEC_REC_MAX_SECONDS     8
 #define AEC_REC_BUF_SAMPLES     (AI_MIRROR_SAMPLE_RATE * AEC_REC_MAX_SECONDS)
 #define AEC_PLAYBACK_DELAY_MS   2000
-#define AEC_TONE_AMPLITUDE      5000
-#define AEC_TONE_FREQ           330
+#define AEC_CHIME_ATTACK_MS      6      /* fast, click-free attack per note */
+#define AEC_CHIME_RELEASE_MS    18      /* fade-out tail per note */
+#define AEC_CHIME_NOTE_GAP_MS   30      /* short silence between notes */
+#define AEC_CHIME_PEAK        3400      /* peak amplitude before envelope (soft) */
+#define AEC_CHIME_DECAY       3.2f      /* exponential decay across a note */
+#define AEC_CHIME_H2_GAIN     0.33f     /* 2nd harmonic (octave) level */
+#define AEC_CHIME_H3_GAIN     0.12f     /* 3rd harmonic level */
+#define AEC_CHIME_NORM        (1.0f + AEC_CHIME_H2_GAIN + AEC_CHIME_H3_GAIN)
+#define AEC_BEEP_DISCARD_MS    200      /* discard mic after start-chime so the tone tail is not recorded */
+
+/* Smart-assistant style chime motifs. A bell-like timbre (fundamental + two
+ * phase-locked harmonics behind a percussive decay envelope) and a rising /
+ * falling perfect-fifth interval make a gentle "AI listening" cue instead of
+ * a raw sine beep. */
+typedef struct {
+    float freq_hz;
+    uint32_t duration_ms;
+} aec_chime_note_t;
+
+/* press: E5 -> B5, rising fifth = "I'm listening" */
+static const aec_chime_note_t s_chime_start[] = {
+    { 659.25f, 90 },
+    { 987.77f, 170 },
+};
+
+/* release: B5 -> E5, falling fifth = "got it, done" */
+static const aec_chime_note_t s_chime_stop[] = {
+    { 987.77f, 90 },
+    { 659.25f, 190 },
+};
 
 static inline uint32_t aec_mean_abs(const int16_t *data, int n)
 {
@@ -232,14 +260,100 @@ static inline uint32_t aec_mean_abs(const int16_t *data, int n)
     return acc / n;
 }
 
+/* Per-note bell envelope: raised-cosine attack, exponential decay body and a
+ * raised-cosine release tail -> gentle, percussive and click-free. */
+static float aec_chime_envelope(uint32_t n, uint32_t total)
+{
+    const uint32_t attack = AI_MIRROR_SAMPLE_RATE * AEC_CHIME_ATTACK_MS / 1000;
+    const uint32_t release = AI_MIRROR_SAMPLE_RATE * AEC_CHIME_RELEASE_MS / 1000;
+    float env;
+
+    if (n < attack) {
+        env = 0.5f * (1.0f - cosf((float)M_PI * (float)n / (float)attack));
+    } else {
+        env = expf(-AEC_CHIME_DECAY * (float)(n - attack) / (float)(total - attack));
+    }
+    if (n > total - release) {
+        env *= 0.5f * (1.0f + cosf((float)M_PI * (float)(n - (total - release)) / (float)release));
+    }
+    return env;
+}
+
+/* Play a bell-like chime motif as recording feedback. Frequencies stay in the
+ * small speaker's efficient range. Blocks the AEC task (owns tx/rx) for the
+ * whole motif. scratch must hold AEC_FRAME_BYTES bytes. */
+static void play_chime(i2s_chan_handle_t tx, i2s_chan_handle_t rx,
+                       int16_t *scratch, const aec_chime_note_t *notes, size_t note_count)
+{
+    const float two_pi = 2.0f * (float)M_PI;
+    const uint32_t gap = AI_MIRROR_SAMPLE_RATE * AEC_CHIME_NOTE_GAP_MS / 1000;
+
+    for (size_t k = 0; k < note_count; k++) {
+        const uint32_t total = AI_MIRROR_SAMPLE_RATE * notes[k].duration_ms / 1000;
+        const uint32_t slot = (k + 1 < note_count) ? total + gap : total;
+        const float phase_inc = two_pi * notes[k].freq_hz / (float)AI_MIRROR_SAMPLE_RATE;
+        float phase = 0.0f;
+        uint32_t n = 0;
+
+        while (n < slot) {
+            for (int j = 0; j < AEC_FRAME_SAMPLES; j++) {
+                int16_t sv = 0;
+                if (n < total) {
+                    /* fundamental + two phase-locked harmonics -> bell timbre */
+                    float v = sinf(phase) +
+                              AEC_CHIME_H2_GAIN * sinf(2.0f * phase) +
+                              AEC_CHIME_H3_GAIN * sinf(3.0f * phase);
+                    v *= (float)AEC_CHIME_PEAK / AEC_CHIME_NORM * aec_chime_envelope(n, total);
+                    sv = (int16_t)v;
+                    phase += phase_inc;
+                    if (phase >= two_pi) {
+                        phase -= two_pi;
+                    }
+                }
+                scratch[2 * j] = sv;
+                scratch[2 * j + 1] = sv;
+                n++;
+            }
+            size_t bw = 0;
+            if (i2s_channel_write(tx, scratch, AEC_FRAME_BYTES, &bw, 1000) != ESP_OK) {
+                break;
+            }
+            size_t br = 0;
+            i2s_channel_read(rx, scratch, AEC_FRAME_BYTES, &br, 1000);
+        }
+    }
+}
+
+/* Recording-start feedback: play the "start listening" chime, then discard
+ * the mic frames that still carry the chime tail so it is not recorded.
+ * ref_ster / mic_ster / chime_buf must each hold AEC_FRAME_BYTES bytes. */
+static void aec_rec_start_feedback(i2s_chan_handle_t tx, i2s_chan_handle_t rx,
+                                   int16_t *ref_ster, int16_t *mic_ster, int16_t *chime_buf)
+{
+    play_chime(tx, rx, chime_buf, s_chime_start,
+               sizeof(s_chime_start) / sizeof(s_chime_start[0]));
+    ESP_LOGI(TAG, "[aec] start chime done");
+
+    const int discard_frames = (AEC_BEEP_DISCARD_MS + AEC_FRAME_MS - 1) / AEC_FRAME_MS;
+    memset(ref_ster, 0, AEC_FRAME_BYTES);
+    for (int d = 0; d < discard_frames; d++) {
+        size_t bw = 0;
+        i2s_channel_write(tx, ref_ster, AEC_FRAME_BYTES, &bw, 1000);
+        size_t br = 0;
+        i2s_channel_read(rx, mic_ster, AEC_FRAME_BYTES, &br, 1000);
+    }
+    ESP_LOGI(TAG, "[aec] discarded %d frames (%d ms) after chime", discard_frames, discard_frames * AEC_FRAME_MS);
+}
+
 static void i2s_aec_demo(void *args)
 {
-    aec_handle_t aec = aec_pro_create(AEC_FRAME_MS, 1, 5);
+    const int aec_mode = 2; /* 0=mild,1/2=medium,3/4=aggressive,5=aggressive+S3 accel */
+    aec_handle_t aec = aec_pro_create(AEC_FRAME_MS, 1, aec_mode);
     if (!aec) {
         ESP_LOGE(TAG, "[aec] aec_pro_create failed, abort task");
         vTaskDelete(NULL);
     }
-    ESP_LOGI(TAG, "[aec] AEC created (mode 5, %dms frame)", AEC_FRAME_MS);
+    ESP_LOGI(TAG, "[aec] AEC created (mode %d, %dms frame)", aec_mode, AEC_FRAME_MS);
 
     int16_t *mic_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     int16_t *ref_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
@@ -248,13 +362,14 @@ static void i2s_aec_demo(void *args)
     int16_t *out_mono = heap_caps_malloc(AEC_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     int16_t *play_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     int16_t *rec_buf = heap_caps_malloc(AEC_REC_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *chime_buf = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
 
-    if (!mic_ster || !ref_ster || !mic_mono || !ref_mono || !out_mono || !play_ster || !rec_buf) {
+    if (!mic_ster || !ref_ster || !mic_mono || !ref_mono || !out_mono || !play_ster || !rec_buf || !chime_buf) {
         ESP_LOGE(TAG, "[aec] no PSRAM for buffers, abort task");
         vTaskDelete(NULL);
     }
 
-    ESP_LOGI(TAG, "[aec] demo ready: hold BTN1 to record (speaker silent, AEC active); release -> ~2s -> normalized playback");
+    ESP_LOGI(TAG, "[aec] demo ready: hold BTN1 to record (speaker silent, AEC active); release -> ~2s -> normalized playback; BTN1 during wait/playback aborts it");
 
 
     int state = 0; /* 0=IDLE, 1=REC, 2=WAIT(2s), 3=PLAY */
@@ -265,14 +380,23 @@ static void i2s_aec_demo(void *args)
     int64_t wait_start_us = 0;
 
     while (1) {
-        /* ---- PLAYBACK: play peak-normalized recording, then go idle ---- */
+        /* ---- PLAYBACK: play peak-normalized recording, then go idle.
+         * BTN1 aborts playback instantly, drops the recording and goes
+         * straight back to REC. ---- */
         if (state == 3) {
             ESP_LOGI(TAG, "[aec] playback start, %u samples (%u ms) gain=x%.2f",
                      (unsigned)rec_samples,
                      (unsigned)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE),
                      (double)play_gain);
             size_t played = 0;
+            bool aborted = false;
             while (played < rec_samples) {
+                /* Poll BTN1 every frame (~16ms) so playback can be interrupted */
+                if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
+                    ESP_LOGI(TAG, "[aec] playback aborted by BTN1, discarding recording");
+                    aborted = true;
+                    break;
+                }
                 size_t n = AEC_FRAME_SAMPLES;
                 if (played + n > rec_samples) {
                     n = rec_samples - played;
@@ -297,6 +421,18 @@ static void i2s_aec_demo(void *args)
                     break;
                 }
                 played += n;
+            }
+            if (aborted) {
+                /* Flush queued playback samples so the speaker goes silent NOW,
+                 * then drop the recording and restart recording directly. */
+                i2s_channel_disable(tx_handle);
+                i2s_channel_enable(tx_handle);
+                state = 1;
+                rec_samples = 0;
+                frame_cnt = 0;
+                ESP_LOGI(TAG, "[aec] recording restart (playback interrupted)");
+                aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
+                continue;
             }
             ESP_LOGI(TAG, "[aec] playback done, %u samples", (unsigned)played);
             state = 0;
@@ -357,6 +493,9 @@ static void i2s_aec_demo(void *args)
                     play_gain = 8.0f;
                 }
                 ESP_LOGI(TAG, "[aec] peak=%d gain=x%.2f", (int)peak, (double)play_gain);
+                play_chime(tx_handle, rx_handle, chime_buf, s_chime_stop,
+                           sizeof(s_chime_stop) / sizeof(s_chime_stop[0]));
+                ESP_LOGI(TAG, "[aec] stop chime done");
                 wait_start_us = esp_timer_get_time();
                 state = 2;
             }
@@ -370,9 +509,19 @@ static void i2s_aec_demo(void *args)
                 rec_samples = 0;
                 frame_cnt = 0;
                 ESP_LOGI(TAG, "[aec] recording start (AEC, speaker silent)");
+                aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
             }
-        } else if (state == 2) { /* WAIT ~2s (silent, I2S kept healthy) */
-            if ((esp_timer_get_time() - wait_start_us) >= 2000000) {
+        } else if (state == 2) { /* WAIT ~2s (silent, I2S kept healthy); BTN1 skips the pending playback and re-records */
+            if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
+                /* Speaker is silent during WAIT, no DMA flush needed: just drop
+                 * the pending recording and restart recording directly. */
+                ESP_LOGI(TAG, "[aec] wait aborted by BTN1, discarding recording");
+                state = 1;
+                rec_samples = 0;
+                frame_cnt = 0;
+                ESP_LOGI(TAG, "[aec] recording restart (wait interrupted)");
+                aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
+            } else if ((esp_timer_get_time() - wait_start_us) >= 2000000) {
                 state = 3;
             }
         }

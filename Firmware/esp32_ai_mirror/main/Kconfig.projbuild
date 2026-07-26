@@ -52,7 +52,7 @@ menu "AI Mirror Configuration"
     config AI_MIRROR_VOICE_VOLUME
         int "Voice volume"
         range 0 100
-        default 72
+        default 70
         help
             Set ES8311 output volume.
 

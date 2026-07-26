@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(ls \"e:/ESP-IDF/master/v5.1/esp-idf/export.sh\" 2>/dev/null && echo \"Found\" || echo \"Not found\")",
-      "Read(//e/ESP-IDF/master/v5.1/esp-idf/**)",
-      "Bash(cmd.exe //c \"cd /d d:\\\\my_project\\\\ai_mirror\\\\Firmware\\\\esp32_ai_mirror && call e:\\\\ESP-IDF\\\\master\\\\v5.1\\\\esp-idf\\\\export.bat && idf.py build 2>&1\")"
-    ]
-  }
-}

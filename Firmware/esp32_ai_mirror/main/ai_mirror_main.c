@@ -13,11 +13,16 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
 #include "driver/i2s_std.h"
 #include "esp_system.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_aec.h"
+#include "esp_vad.h"
+#include "opus.h"
 #include <math.h>
 #include "es8311.h"
 #include "ai_mirror_config.h"
@@ -119,7 +124,21 @@ static esp_err_t es8311_codec_init(void)
     ESP_RETURN_ON_ERROR(es8311_voice_volume_set(es_handle, AI_MIRROR_VOICE_VOLUME, NULL), TAG, "set es8311 volume failed");
     ESP_RETURN_ON_ERROR(es8311_microphone_config(es_handle, false), TAG, "set es8311 microphone failed");
 #if CONFIG_AI_MIRROR_AUDIO_MODE_ECHO
-    ESP_RETURN_ON_ERROR(es8311_microphone_gain_set(es_handle, AI_MIRROR_MIC_GAIN), TAG, "set es8311 microphone gain failed");
+    /* 麦克风增益设置偶发 I²C 写失败(瞬时 NACK),重试几次;仍失败则降级
+     * 为警告 - 增益设不上仍可使用默认增益录音,不应让整个音频系统禁用
+     * 而阻塞 AEC 演示与后续调试。 */
+    esp_err_t mic_gain_ret = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        mic_gain_ret = es8311_microphone_gain_set(es_handle, AI_MIRROR_MIC_GAIN);
+        if (mic_gain_ret == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "set es8311 microphone gain failed (attempt %d, 0x%x)", attempt + 1, mic_gain_ret);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (mic_gain_ret != ESP_OK) {
+        ESP_LOGW(TAG, "microphone gain set failed after retries, continuing with default gain");
+    }
 #endif
     return ESP_OK;
 }
@@ -129,6 +148,8 @@ static esp_err_t i2s_driver_init(void)
 #if !defined(CONFIG_AI_MIRROR_BSP)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
+    chan_cfg.dma_desc_num = 8;
+    chan_cfg.dma_frame_num = 480;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle));
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AI_MIRROR_SAMPLE_RATE),
@@ -202,11 +223,11 @@ static void i2s_music(void *args)
  *
  * The speaker stays silent during recording (no far-end reference), so
  * AEC runs with a zero reference and just passes the cleaned mic signal
- * through. Hold BTN1 to record; a short bell-like chime is played on press
- * and on release as feedback. ~2 s after release the peak-normalized
- * recording is played back so you can hear the captured voice. Pressing
- * BTN1 during the pre-playback wait or during playback aborts it instantly,
- * drops that recording and goes straight back to recording.
+ * through. Press BTN1 once to start recording (no need to hold); a start
+ * chime plays as feedback. VAD then watches the cleaned mic and ends the
+ * recording when it detects trailing silence after speech. The recording is
+ * opus-encoded, opus-decoded, then played back immediately. Pressing BTN1
+ * during encode/decode/playback drops that recording and starts a new one.
  * ---------------------------------------------------------------- */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -216,9 +237,11 @@ static void i2s_music(void *args)
 #define AEC_FRAME_SAMPLES       (AI_MIRROR_SAMPLE_RATE * AEC_FRAME_MS / 1000)
 #define AEC_STEREO_SAMPLES      (AEC_FRAME_SAMPLES * 2)
 #define AEC_FRAME_BYTES         (AEC_STEREO_SAMPLES * sizeof(int16_t))
-#define AEC_REC_MAX_SECONDS     8
+#define AEC_REC_MAX_SECONDS     20
 #define AEC_REC_BUF_SAMPLES     (AI_MIRROR_SAMPLE_RATE * AEC_REC_MAX_SECONDS)
-#define AEC_PLAYBACK_DELAY_MS   2000
+#define AEC_VAD_SILENCE_END_MS  1000    /* ms: trailing silence after speech -> "user stopped talking" */
+#define AEC_VAD_TAIL_DROP_MS    900   /* ms of tail silence to drop before decode (< VAD 1s threshold) */
+#define AEC_VAD_TAIL_DROP_FRAMES  (AEC_VAD_TAIL_DROP_MS / VAD_FRAME_MS)  /* 45 opus frames (~0.9s) */
 #define AEC_CHIME_ATTACK_MS      6      /* fast, click-free attack per note */
 #define AEC_CHIME_RELEASE_MS    18      /* fade-out tail per note */
 #define AEC_CHIME_NOTE_GAP_MS   30      /* short silence between notes */
@@ -228,6 +251,19 @@ static void i2s_music(void *args)
 #define AEC_CHIME_H3_GAIN     0.12f     /* 3rd harmonic level */
 #define AEC_CHIME_NORM        (1.0f + AEC_CHIME_H2_GAIN + AEC_CHIME_H3_GAIN)
 #define AEC_BEEP_DISCARD_MS    200      /* discard mic after start-chime so the tone tail is not recorded */
+
+/* VAD + OPUS framing. VAD runs on 8kHz downsampled audio (lighter workload). It now
+ * decides REC stop: once speech is heard, AEC_VAD_SILENCE_END_MS of trailing silence
+ * ends the recording. OPUS encodes the 16kHz rec_buf in batch AFTER recording (ENCODE
+ * state) -- real-time encode (~28ms/20ms frame) was a REC bottleneck, so it stays
+ * deferred. */
+#define VAD_SAMPLE_RATE_HZ     8000
+#define VAD_FRAME_MS           20
+#define VAD_FRAME_SAMPLES       (VAD_SAMPLE_RATE_HZ * VAD_FRAME_MS / 1000)        /* 160 @8kHz */
+#define VAD_BUF_SAMPLES        (VAD_FRAME_SAMPLES * 2)                             /* 320 */
+#define OPUS_FRAME_SAMPLES     (AI_MIRROR_SAMPLE_RATE * VAD_FRAME_MS / 1000)      /* 320 @16kHz */
+#define OPUS_OUT_BYTES         400
+#define AEC_OPUS_MAX_FRAMES    (AEC_REC_BUF_SAMPLES / OPUS_FRAME_SAMPLES)          /* max opus frames in an 8s recording (400) */
 
 /* Smart-assistant style chime motifs. A bell-like timbre (fundamental + two
  * phase-locked harmonics behind a percussive decay envelope) and a rising /
@@ -345,8 +381,107 @@ static void aec_rec_start_feedback(i2s_chan_handle_t tx, i2s_chan_handle_t rx,
     ESP_LOGI(TAG, "[aec] discarded %d frames (%d ms) after chime", discard_frames, discard_frames * AEC_FRAME_MS);
 }
 
+/* OPUS encode context shared between the recording task and the async
+ * opus_enc_task. The recorder pushes opus-frame sample offsets into a queue
+ * while recording; opus_enc_task drains it, encodes, and signals done. */
+typedef struct {
+    OpusEncoder *enc;
+    OpusDecoder *dec;
+    int16_t *rec_buf;
+    uint8_t *packed;
+    int16_t *frame_bytes;
+    uint8_t *out;
+    int16_t *decode_buf;
+    volatile size_t packed_len;
+    volatile uint32_t frame_cnt;
+    uint32_t total_bytes;
+    volatile bool drop_tail;        /* drop trailing ~0.9s on VAD end (set by recorder, read by enc_task) */
+    volatile size_t decode_samples; /* decoded PCM samples (written by enc_task, read by recorder for PLAY) */
+    volatile int32_t decode_peak;   /* peak of decode_buf (for play_gain) */
+    volatile int64_t enc_done_us;   /* timestamp when encoding finished (for enc/dec timing split) */
+    QueueHandle_t queue;
+    SemaphoreHandle_t done_sem;
+} opus_enc_ctx_t;
+
+static opus_enc_ctx_t s_enc;
+
+/* Async opus encoder task: lower priority than the recorder (prio 5) so it
+ * never starves capture. Pinned to CPU0 so rec_buf (written by the recorder
+ * on CPU0) is read on the same core -- no cross-core PSRAM cache issues. */
+static void opus_enc_task(void *args)
+{
+    (void)args;
+    int offset;
+    while (1) {
+        if (xQueueReceive(s_enc.queue, &offset, portMAX_DELAY) != pdPASS) {
+            continue;
+        }
+        if (offset < 0) {
+            /* end marker: encoding finished. Now decode packed -> decode_buf on this same
+             * CPU1 task (encode and decode are mutually exclusive -- they never overlap),
+             * then signal done so the recorder can play. */
+            s_enc.enc_done_us = esp_timer_get_time();
+            size_t dec_limit = s_enc.frame_cnt;
+            if (s_enc.drop_tail && dec_limit >= AEC_VAD_TAIL_DROP_FRAMES) {
+                dec_limit -= AEC_VAD_TAIL_DROP_FRAMES;
+            }
+            size_t dec_byte_off = 0;
+            size_t dec_samples = 0;
+            int32_t peak = 1;
+            if (s_enc.dec && s_enc.decode_buf) {
+                for (size_t i = 0; i < dec_limit; i++) {
+                    int dec_n = opus_decode(s_enc.dec, s_enc.packed + dec_byte_off,
+                                            s_enc.frame_bytes[i],
+                                            s_enc.decode_buf + i * OPUS_FRAME_SAMPLES,
+                                            OPUS_FRAME_SAMPLES, 0);
+                    if (dec_n > 0) {
+                        for (int k = 0; k < dec_n; k++) {
+                            int32_t v = s_enc.decode_buf[i * OPUS_FRAME_SAMPLES + k];
+                            int32_t a = (v < 0) ? -v : v;
+                            if (a > peak) {
+                                peak = a;
+                            }
+                        }
+                        dec_samples += dec_n;
+                    }
+                    dec_byte_off += s_enc.frame_bytes[i];
+                    if ((i % 10) == 0) {
+                        vTaskDelay(pdMS_TO_TICKS(1)); /* yield so the watchdog does not fire */
+                    }
+                    if ((i % 25) == 0) {
+                        ESP_LOGI(TAG, "[aec] enc_task dec f=%u/%u samples=%u",
+                                 (unsigned)i, (unsigned)dec_limit, (unsigned)dec_samples);
+                    }
+                }
+            }
+            s_enc.decode_samples = dec_samples;
+            s_enc.decode_peak = peak;
+            ESP_LOGI(TAG, "[aec] enc_task end-marker: dec %u/%u frames %u samples, give sem",
+                     (unsigned)dec_limit, (unsigned)s_enc.frame_cnt, (unsigned)dec_samples);
+            xSemaphoreGive(s_enc.done_sem);
+            continue;
+        }
+        if (s_enc.frame_cnt < AEC_OPUS_MAX_FRAMES &&
+            s_enc.packed_len + OPUS_OUT_BYTES <= (size_t)AEC_OPUS_MAX_FRAMES * OPUS_OUT_BYTES) {
+            opus_int32 enc_bytes = opus_encode(s_enc.enc, s_enc.rec_buf + offset,
+                                               OPUS_FRAME_SAMPLES, s_enc.out, OPUS_OUT_BYTES);
+            if (enc_bytes > 0) {
+                memcpy(s_enc.packed + s_enc.packed_len, s_enc.out, (size_t)enc_bytes);
+                s_enc.frame_bytes[s_enc.frame_cnt] = (int16_t)enc_bytes;
+                s_enc.packed_len += enc_bytes;
+                s_enc.total_bytes += enc_bytes;
+                s_enc.frame_cnt++;
+                if ((s_enc.frame_cnt % 25) == 0) {
+                    ESP_LOGI(TAG, "[aec] enc_task f=%u packed=%uB", (unsigned)s_enc.frame_cnt, (unsigned)s_enc.total_bytes);
+                }
+            }
+        }
+    }
+}
+
 static void i2s_aec_demo(void *args)
 {
+    ESP_LOGI(TAG, "[aec] task entered, calling aec_pro_create");
     const int aec_mode = 2; /* 0=mild,1/2=medium,3/4=aggressive,5=aggressive+S3 accel */
     aec_handle_t aec = aec_pro_create(AEC_FRAME_MS, 1, aec_mode);
     if (!aec) {
@@ -355,6 +490,25 @@ static void i2s_aec_demo(void *args)
     }
     ESP_LOGI(TAG, "[aec] AEC created (mode %d, %dms frame)", aec_mode, AEC_FRAME_MS);
 
+    /* VAD + OPUS encoder: voice-activity detection + compressed encoding demo.
+     * VAD/OPUS use 20ms (320 samples @16kHz) frames; AEC uses 16ms (256), so we
+     * accumulate AEC-cleaned audio into a ring buffer and feed 20ms slices. */
+    vad_handle_t vad = vad_create(VAD_MODE_3);
+    int opus_err = 0;
+    OpusEncoder *opus_enc = opus_encoder_create(AI_MIRROR_SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_err);
+    if (opus_enc && opus_err == OPUS_OK) {
+        opus_encoder_ctl(opus_enc, OPUS_SET_BITRATE(30000)); /* 30 kbps, voice-grade */
+        opus_encoder_ctl(opus_enc, OPUS_SET_COMPLEXITY(3)); /* lower complexity -> faster encode on S3 */
+        ESP_LOGI(TAG, "[aec] VAD+OPUS ready (opus 30kbps, complexity 3)");
+    } else {
+        ESP_LOGE(TAG, "[aec] opus_encoder_create failed err=%d (VAD still runs)", opus_err);
+    }
+    int opus_dec_err = 0;
+    OpusDecoder *opus_dec = opus_decoder_create(AI_MIRROR_SAMPLE_RATE, 1, &opus_dec_err);
+    if (!opus_dec || opus_dec_err != OPUS_OK) {
+        ESP_LOGE(TAG, "[aec] opus_decoder_create failed err=%d (decode disabled)", opus_dec_err);
+    }
+
     int16_t *mic_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     int16_t *ref_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     int16_t *mic_mono = heap_caps_malloc(AEC_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -362,35 +516,87 @@ static void i2s_aec_demo(void *args)
     int16_t *out_mono = heap_caps_malloc(AEC_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     int16_t *play_ster = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     int16_t *rec_buf = heap_caps_malloc(AEC_REC_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *decode_buf = heap_caps_malloc(AEC_REC_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM); /* opus-decoded PCM for playback */
     int16_t *chime_buf = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
+    int16_t *vad_buf = heap_caps_malloc(VAD_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM); /* ring buf 2x160 @8kHz */
+    int16_t *ds_buf = heap_caps_malloc(AEC_FRAME_SAMPLES / 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM); /* 16k->8k downsample scratch */
+    uint8_t *opus_out = heap_caps_malloc(OPUS_OUT_BYTES, MALLOC_CAP_SPIRAM); /* single-frame OPUS encode scratch */
+    uint8_t *opus_packed = heap_caps_malloc(AEC_OPUS_MAX_FRAMES * OPUS_OUT_BYTES, MALLOC_CAP_SPIRAM); /* packed OPUS frames for decode */
+    int16_t *opus_frame_bytes = heap_caps_malloc(AEC_OPUS_MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM); /* per-frame encoded byte count */
 
-    if (!mic_ster || !ref_ster || !mic_mono || !ref_mono || !out_mono || !play_ster || !rec_buf || !chime_buf) {
+    if (!mic_ster || !ref_ster || !mic_mono || !ref_mono || !out_mono || !play_ster || !rec_buf || !decode_buf || !chime_buf || !vad_buf || !ds_buf || !opus_out || !opus_packed || !opus_frame_bytes) {
         ESP_LOGE(TAG, "[aec] no PSRAM for buffers, abort task");
         vTaskDelete(NULL);
     }
 
-    ESP_LOGI(TAG, "[aec] demo ready: hold BTN1 to record (speaker silent, AEC active); release -> ~2s -> normalized playback; BTN1 during wait/playback aborts it");
+    /* Share opus encode resources with the async opus_enc_task. The recorder
+     * (this task) pushes opus-frame offsets while recording; opus_enc_task
+     * encodes them in the background and signals done. */
+    s_enc.enc = opus_enc;
+    s_enc.dec = opus_dec;
+    s_enc.rec_buf = rec_buf;
+    s_enc.packed = opus_packed;
+    s_enc.frame_bytes = opus_frame_bytes;
+    s_enc.out = opus_out;
+    s_enc.decode_buf = decode_buf;
+    s_enc.packed_len = 0;
+    s_enc.frame_cnt = 0;
+    s_enc.total_bytes = 0;
+    s_enc.drop_tail = false;
+    s_enc.decode_samples = 0;
+    s_enc.decode_peak = 1;
+    s_enc.queue = xQueueCreate(AEC_OPUS_MAX_FRAMES, sizeof(int));
+    s_enc.done_sem = xSemaphoreCreateBinary();
+    if (s_enc.queue && s_enc.done_sem) {
+        TaskHandle_t enc_handle = NULL;
+        BaseType_t tret = xTaskCreatePinnedToCoreWithCaps(opus_enc_task, "opus_enc", 16384, NULL, 4, &enc_handle, 1, MALLOC_CAP_SPIRAM);
+        if (tret == pdPASS) {
+            ESP_LOGI(TAG, "[aec] async opus encoder task started (prio 4, CPU1, stack 16k PSRAM)");
+        } else {
+            ESP_LOGE(TAG, "[aec] failed to create opus_enc task ret=%d", (int)tret);
+        }
+    } else {
+        ESP_LOGE(TAG, "[aec] failed to create opus enc queue/sem, encoding disabled");
+    }
+
+    ESP_LOGI(TAG, "[aec] demo ready: press BTN1 to record (AEC OFF, raw mic); VAD trailing-silence stops REC; async opus encode during REC -> decode -> playback; BTN1 during wait-enc/decode/playback aborts it");
 
 
-    int state = 0; /* 0=IDLE, 1=REC, 2=WAIT(2s), 3=PLAY */
+    int state = 0; /* 0=IDLE, 1=REC, 2=WAIT_ENC, 3=DECODE, 4=PLAY */
     size_t rec_samples = 0;
     uint32_t frame_cnt = 0;
     uint32_t idle_cnt = 0;
     float play_gain = 1.0f;
-    int64_t wait_start_us = 0;
+    int64_t rec_start_us = 0;
+    int64_t frame_start_us = 0;
+    int64_t enc_start_us = 0;      /* encode start timestamp (pushed end-marker); for enc timing */
+    bool btn_prev = false;         /* BTN1 level last frame (press-edge trigger) */
+
+    /* VAD + OPUS state. opus encode counters live in s_enc (written by
+     * opus_enc_task); opus_off is maintained by this recorder task. */
+    int vad_len = 0;
+    uint32_t vad_speech_cnt = 0, vad_silence_cnt = 0;
+    bool vad_heard_speech = false; /* set once VAD detects speech during this REC */
+    uint32_t vad_silence_run = 0;  /* consecutive VAD silence frames since last speech */
+    size_t opus_off = 0;          /* next opus frame's sample offset in rec_buf (pushed to enc queue) */
 
     while (1) {
-        /* ---- PLAYBACK: play peak-normalized recording, then go idle.
+        /* BTN1 press-edge: sampled once per frame so IDLE triggers on a fresh press
+         * (no need to hold). btn_prev is updated at frame end (PLAY has its own loop). */
+        bool btn_now = board_button_is_pressed(BOARD_BUTTON_ID_1);
+        bool btn_press_edge = btn_now && !btn_prev;
+
+        /* ---- PLAYBACK: play peak-normalized OPUS-decoded audio, then go idle.
          * BTN1 aborts playback instantly, drops the recording and goes
          * straight back to REC. ---- */
-        if (state == 3) {
+        if (state == 4) {
             ESP_LOGI(TAG, "[aec] playback start, %u samples (%u ms) gain=x%.2f",
-                     (unsigned)rec_samples,
-                     (unsigned)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE),
+                     (unsigned)s_enc.decode_samples,
+                     (unsigned)(s_enc.decode_samples * 1000U / AI_MIRROR_SAMPLE_RATE),
                      (double)play_gain);
             size_t played = 0;
             bool aborted = false;
-            while (played < rec_samples) {
+            while (played < s_enc.decode_samples) {
                 /* Poll BTN1 every frame (~16ms) so playback can be interrupted */
                 if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
                     ESP_LOGI(TAG, "[aec] playback aborted by BTN1, discarding recording");
@@ -398,11 +604,11 @@ static void i2s_aec_demo(void *args)
                     break;
                 }
                 size_t n = AEC_FRAME_SAMPLES;
-                if (played + n > rec_samples) {
-                    n = rec_samples - played;
+                if (played + n > s_enc.decode_samples) {
+                    n = s_enc.decode_samples - played;
                 }
                 for (size_t j = 0; j < n; j++) {
-                    float fv = (float)rec_buf[played + j] * play_gain;
+                    float fv = (float)decode_buf[played + j] * play_gain;
                     if (fv > 32767.0f) {
                         fv = 32767.0f;
                     }
@@ -427,17 +633,27 @@ static void i2s_aec_demo(void *args)
                  * then drop the recording and restart recording directly. */
                 i2s_channel_disable(tx_handle);
                 i2s_channel_enable(tx_handle);
+                if (s_enc.queue) { xQueueReset(s_enc.queue); }
+                if (s_enc.done_sem) { xSemaphoreTake(s_enc.done_sem, 0); } /* clear stale done */
                 state = 1;
                 rec_samples = 0;
                 frame_cnt = 0;
+                opus_off = 0;
+                vad_heard_speech = false;
+                vad_silence_run = 0;
+                s_enc.packed_len = 0;
+                s_enc.frame_cnt = 0;
+                s_enc.total_bytes = 0;
+                s_enc.drop_tail = false;
                 ESP_LOGI(TAG, "[aec] recording restart (playback interrupted)");
                 aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
+                rec_start_us = esp_timer_get_time();
                 continue;
             }
             ESP_LOGI(TAG, "[aec] playback done, %u samples", (unsigned)played);
+            /* OPUS was already batch-encoded before playback; go back to IDLE. */
             state = 0;
             idle_cnt = 0;
-            vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
@@ -446,12 +662,9 @@ static void i2s_aec_demo(void *args)
         memset(ref_ster, 0, AEC_FRAME_BYTES);
 
         size_t bw = 0, br = 0;
-        esp_err_t wret = i2s_channel_write(tx_handle, ref_ster, AEC_FRAME_BYTES, &bw, 1000);
-        if (wret != ESP_OK) {
-            ESP_LOGE(TAG, "[aec] tx write failed: %s", esp_err_to_name(wret));
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
+        /* Non-blocking tx write (silence): dropping is fine, auto_clear keeps speaker silent.
+         * Blocking write waited ~16ms per frame and caused ~50% frame drops. */
+        (void)i2s_channel_write(tx_handle, ref_ster, AEC_FRAME_BYTES, &bw, 0);
         esp_err_t rret = i2s_channel_read(rx_handle, mic_ster, AEC_FRAME_BYTES, &br, 1000);
         if (rret != ESP_OK) {
             ESP_LOGE(TAG, "[aec] rx read failed: %s", esp_err_to_name(rret));
@@ -462,69 +675,155 @@ static void i2s_aec_demo(void *args)
             mic_mono[j] = mic_ster[2 * j];
         }
 
-        if (state == 1) { /* REC: run AEC + store cleaned audio */
-            aec_process(aec, mic_mono, ref_mono, out_mono);
+        if (state == 1) { /* REC: AEC OFF, store raw mic + feed VAD + push opus frames to enc task */
+            frame_start_us = esp_timer_get_time();
+
+            /* VAD on raw mic (AEC disabled): downsample mic_mono (16k/256s) to 8k
+             * (128s) and feed 20ms (160s @8kHz) frames to VAD. REC stop is decided
+             * by VAD trailing silence after speech. */
+            {
+                const int ds_n = AEC_FRAME_SAMPLES / 2;
+                for (int j = 0; j < ds_n; j++) {
+                    ds_buf[j] = (int16_t)(((int32_t)mic_mono[2 * j] + (int32_t)mic_mono[2 * j + 1]) >> 1);
+                }
+                int copied = 0;
+                while (copied < ds_n) {
+                    int space = VAD_BUF_SAMPLES - vad_len;
+                    int n = ds_n - copied;
+                    if (n > space) n = space;
+                    memcpy(vad_buf + vad_len, ds_buf + copied, n * sizeof(int16_t));
+                    vad_len += n;
+                    copied += n;
+                    while (vad_len >= VAD_FRAME_SAMPLES) {
+                        vad_state_t vst = vad_process(vad, vad_buf, VAD_SAMPLE_RATE_HZ, VAD_FRAME_MS);
+                        if (vst == VAD_SPEECH) {
+                            vad_speech_cnt++;
+                            vad_heard_speech = true;
+                            vad_silence_run = 0;
+                        } else {
+                            vad_silence_cnt++;
+                            if (vad_heard_speech) {
+                                vad_silence_run++;
+                            }
+                        }
+                        if ((vad_speech_cnt + vad_silence_cnt) % 25 == 0) {
+                            ESP_LOGI(TAG, "[aec] VAD:%s spk=%u sil=%u run=%u",
+                                     vst == VAD_SPEECH ? "SPK" : "sil",
+                                     (unsigned)vad_speech_cnt, (unsigned)vad_silence_cnt,
+                                     (unsigned)vad_silence_run);
+                        }
+                        memmove(vad_buf, vad_buf + VAD_FRAME_SAMPLES, (vad_len - VAD_FRAME_SAMPLES) * sizeof(int16_t));
+                        vad_len -= VAD_FRAME_SAMPLES;
+                    }
+                }
+            }
+
             size_t room = AEC_REC_BUF_SAMPLES - rec_samples;
             size_t n = (AEC_FRAME_SAMPLES < room) ? AEC_FRAME_SAMPLES : room;
             memcpy(rec_buf + rec_samples, mic_mono, n * sizeof(int16_t));
             rec_samples += n;
 
+            /* push complete 20ms (320-sample) opus frames to the async encoder task */
+            while (rec_samples - opus_off >= OPUS_FRAME_SAMPLES && opus_off + OPUS_FRAME_SAMPLES <= AEC_REC_BUF_SAMPLES) {
+                int offset = (int)opus_off;
+                if (s_enc.queue && xQueueSend(s_enc.queue, &offset, 0) != pdPASS) {
+                    ESP_LOGW(TAG, "[aec] enc queue full, dropping opus frame off=%u", (unsigned)opus_off);
+                }
+                opus_off += OPUS_FRAME_SAMPLES;
+            }
+
             if ((frame_cnt % 31) == 0) {
                 uint32_t mic_lvl = aec_mean_abs(mic_mono, AEC_FRAME_SAMPLES);
-                uint32_t out_lvl = aec_mean_abs(out_mono, AEC_FRAME_SAMPLES);
-                ESP_LOGI(TAG, "[aec] lvl mic=%u out=%u (REC)", (unsigned)mic_lvl, (unsigned)out_lvl);
+                ESP_LOGI(TAG, "[aec] lvl mic=%u (REC, AEC off) frame=%uus rt=16000us", (unsigned)mic_lvl, (unsigned)(esp_timer_get_time() - frame_start_us));
             }
             frame_cnt++;
 
-            if (!board_button_is_pressed(BOARD_BUTTON_ID_1) || rec_samples >= AEC_REC_BUF_SAMPLES) {
-                ESP_LOGI(TAG, "[aec] recording stop, %u samples (%u ms)",
+            /* REC stop is decided by VAD: once speech has been heard, trailing silence
+             * of AEC_VAD_SILENCE_END_MS means the user finished talking. Buffer-full is
+             * a safety cap. (BTN1 no longer stops REC -- a press only starts it.) */
+            bool vad_end = vad_heard_speech &&
+                           (vad_silence_run * VAD_FRAME_MS >= AEC_VAD_SILENCE_END_MS);
+            if (vad_end || rec_samples >= AEC_REC_BUF_SAMPLES) {
+                s_enc.drop_tail = vad_end;  /* drop trailing ~0.9s silence only on VAD end */
+                ESP_LOGI(TAG, "[aec] recording stop (%s), %u samples (%u ms)",
+                         vad_end ? "vad-silence" : "buf-full",
                          (unsigned)rec_samples,
                          (unsigned)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE));
-                int32_t peak = 1;
-                for (size_t k = 0; k < rec_samples; k++) {
-                    int32_t v = rec_buf[k];
-                    int32_t a = (v < 0) ? -v : v;
-                    if (a > peak) {
-                        peak = a;
-                    }
-                }
-                play_gain = 24000.0f / (float)peak;
-                if (play_gain > 8.0f) {
-                    play_gain = 8.0f;
-                }
-                ESP_LOGI(TAG, "[aec] peak=%d gain=x%.2f", (int)peak, (double)play_gain);
+                {                     int64_t rec_wall_us = esp_timer_get_time() - rec_start_us;                     uint32_t rec_wall_ms = (uint32_t)(rec_wall_us / 1000);                     uint32_t expected_ms = (uint32_t)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE);                     ESP_LOGI(TAG, "[aec] diag: rec wall=%ums expected16k=%ums ratio=%.2f", (unsigned)rec_wall_ms, (unsigned)expected_ms, rec_wall_ms ? (double)expected_ms / (double)rec_wall_ms : 0.0);                 }
                 play_chime(tx_handle, rx_handle, chime_buf, s_chime_stop,
                            sizeof(s_chime_stop) / sizeof(s_chime_stop[0]));
                 ESP_LOGI(TAG, "[aec] stop chime done");
-                wait_start_us = esp_timer_get_time();
+                /* Push end-marker: opus_enc_task finishes the last queued frames,
+                 * then decodes packed -> decode_buf, then signals done. Enter WAIT_ENC. */
+                int end_marker = -1;
+                if (s_enc.queue) {
+                    xQueueSend(s_enc.queue, &end_marker, portMAX_DELAY);
+                }
+                enc_start_us = esp_timer_get_time();
                 state = 2;
             }
-        } else if (state == 0) { /* IDLE: silent, wait for BTN1 */
+        } else if (state == 0) { /* IDLE: silent, wait for BTN1 press-edge */
             idle_cnt++;
             if ((idle_cnt % 375) == 0) {
-                ESP_LOGI(TAG, "[aec] idle (silent), ready - hold BTN1 to record");
+                ESP_LOGI(TAG, "[aec] idle (silent), ready - press BTN1 to record");
             }
-            if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
+            if (btn_press_edge) {
                 state = 1;
                 rec_samples = 0;
                 frame_cnt = 0;
-                ESP_LOGI(TAG, "[aec] recording start (AEC, speaker silent)");
+                opus_off = 0;
+                vad_heard_speech = false;
+                vad_silence_run = 0;
+                /* reset opus encode state + drain any stale queue/done */
+                s_enc.packed_len = 0;
+                s_enc.frame_cnt = 0;
+                s_enc.total_bytes = 0;
+                s_enc.drop_tail = false;
+                if (s_enc.queue) {
+                    xQueueReset(s_enc.queue);
+                }
+                if (s_enc.done_sem) { xSemaphoreTake(s_enc.done_sem, 0); } /* clear stale done */
+                ESP_LOGI(TAG, "[aec] recording start (AEC off, raw mic) - VAD will stop");
                 aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
+                rec_start_us = esp_timer_get_time();
             }
-        } else if (state == 2) { /* WAIT ~2s (silent, I2S kept healthy); BTN1 skips the pending playback and re-records */
-            if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
-                /* Speaker is silent during WAIT, no DMA flush needed: just drop
-                 * the pending recording and restart recording directly. */
-                ESP_LOGI(TAG, "[aec] wait aborted by BTN1, discarding recording");
+        } else if (state == 2) { /* WAIT_ENC: wait for async opus_enc_task to finish encode+decode, then PLAY. BTN1 aborts -> REC. */
+            if (btn_now) {
+                ESP_LOGI(TAG, "[aec] wait-enc aborted by BTN1, discarding recording");
+                if (s_enc.queue) { xQueueReset(s_enc.queue); }
+                if (s_enc.done_sem) { xSemaphoreTake(s_enc.done_sem, 0); } /* clear stale done */
                 state = 1;
                 rec_samples = 0;
                 frame_cnt = 0;
-                ESP_LOGI(TAG, "[aec] recording restart (wait interrupted)");
+                opus_off = 0;
+                vad_heard_speech = false;
+                vad_silence_run = 0;
+                s_enc.packed_len = 0;
+                s_enc.frame_cnt = 0;
+                s_enc.total_bytes = 0;
+                s_enc.drop_tail = false;
                 aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
-            } else if ((esp_timer_get_time() - wait_start_us) >= 2000000) {
-                state = 3;
+                rec_start_us = esp_timer_get_time();
+            } else if (!s_enc.queue || !s_enc.done_sem || xSemaphoreTake(s_enc.done_sem, 0) == pdPASS) {
+                /* encode + decode complete (or no encoder): compute play_gain from decode_peak, then PLAY */
+                int64_t now_us = esp_timer_get_time();
+                uint32_t enc_ms = (uint32_t)((s_enc.enc_done_us - enc_start_us) / 1000);
+                uint32_t dec_ms = (uint32_t)((now_us - s_enc.enc_done_us) / 1000);
+                play_gain = 24000.0f / (float)s_enc.decode_peak;
+                if (play_gain > 8.0f) {
+                    play_gain = 8.0f;
+                }
+                ESP_LOGI(TAG, "[aec] opus enc+dec done: %u frames %u bytes, dec=%u samples peak=%d gain=x%.2f (enc=%ums dec=%ums)",
+                         (unsigned)s_enc.frame_cnt, (unsigned)s_enc.total_bytes,
+                         (unsigned)s_enc.decode_samples, (int)s_enc.decode_peak, (double)play_gain,
+                         (unsigned)enc_ms, (unsigned)dec_ms);
+                state = 4;
+            } else {
+                /* still encoding/decoding: yield CPU to opus_enc_task */
+                vTaskDelay(pdMS_TO_TICKS(1));
             }
         }
+        btn_prev = btn_now;
     }
 }
 #endif
@@ -773,7 +1072,14 @@ static void ai_mirror_audio_start(bool audio_ok)
 #else
     if (audio_ok) {
         ESP_LOGI(TAG, "Start AEC demo");
-        xTaskCreate(i2s_aec_demo, "aec_demo", 12288, NULL, 5, NULL);
+        ESP_LOGI(TAG, "[aec] internal free heap before xTaskCreate: %u bytes",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        BaseType_t xret = xTaskCreate(i2s_aec_demo, "aec_demo", 16384, NULL, 5, NULL);
+        if (xret != pdPASS) {
+            ESP_LOGE(TAG, "[aec] xTaskCreate FAILED (ret=%d), task not started", (int)xret);
+        } else {
+            ESP_LOGI(TAG, "[aec] xTaskCreate OK, aec_demo task created");
+        }
     } else {
         ESP_LOGW(TAG, "Audio disabled, AEC task not started");
     }

@@ -220,6 +220,7 @@ esp_err_t board_rgb_set_rgb(uint8_t red, uint8_t green, uint8_t blue)
 static void rgb_rainbow_task(void *arg)
 {
     uint16_t hue = 0;
+    rmt_transmit_config_t tx_config = { .loop_count = 0 };
 
     while (1) {
         uint8_t red;
@@ -227,7 +228,16 @@ static void rgb_rainbow_task(void *arg)
         uint8_t blue;
 
         hsv_to_rgb(hue, 255, 32, &red, &green, &blue);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(board_rgb_set_rgb(red, green, blue));
+        s_led_pixels[0] = green;
+        s_led_pixels[1] = red;
+        s_led_pixels[2] = blue;
+        /* Async fire-and-forget: RMT sends the ~310us frame in the background;
+         * trans_queue_depth=4 easily absorbs the 10ms cadence. Calling the
+         * synchronous board_rgb_set_rgb() here (which waits up to 100ms for the
+         * previous frame) flooded the log with ESP_ERR_TIMEOUT whenever the AEC
+         * task preempted us during recording. */
+        (void)rmt_transmit(s_led_chan, s_led_encoder, s_led_pixels,
+                           sizeof(s_led_pixels), &tx_config);
 
         hue = (hue + 2) % 360;
         vTaskDelay(pdMS_TO_TICKS(10));

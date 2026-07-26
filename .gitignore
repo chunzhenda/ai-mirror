@@ -1,0 +1,29 @@
+# ESP-IDF build output
+Firmware/esp32_ai_mirror/build/
+Firmware/esp32_ai_mirror/managed_components/
+
+# ESP-IDF managed components lock
+Firmware/esp32_ai_mirror/managed_components_lock/
+
+# ESP-IDF
+sdkconfig.old
+Firmware/esp32_ai_mirror/sdkconfig.old
+
+# Build logs
+*.log
+aec_build*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.claude/
+.codegraph/
+.qoder/
+.agents/
+
+# OS
+Thumbs.db
+.DS_Store

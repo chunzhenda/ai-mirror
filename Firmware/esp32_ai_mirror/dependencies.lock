@@ -1,4 +1,14 @@
 dependencies:
+  esphome/micro-opus:
+    component_hash: c4cec51b6e45b9b660bf8725a10c65f46485ff8b37ff664e4da3fd738301c71e
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.4.1
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -117,11 +127,12 @@ dependencies:
       type: service
     version: 8.4.0
 direct_dependencies:
+- esphome/micro-opus
 - espressif/cmake_utilities
 - espressif/es8311
 - espressif/esp-box
 - espressif/esp-dsp
 - idf
-manifest_hash: d0a1873215ef7e1558f922ce23a7fe3927082414e1bf1ddee5d217abf6d244b2
+manifest_hash: 8668818200527c6ce76b6860a27a06105ec2b92f69bce273ea5f3a259fcf1d80
 target: esp32s3
 version: 2.0.0

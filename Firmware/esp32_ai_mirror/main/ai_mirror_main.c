@@ -22,6 +22,9 @@
 #include "esp_heap_caps.h"
 #include "esp_aec.h"
 #include "esp_vad.h"
+#include "esp_wn_iface.h"
+#include "esp_wn_models.h"
+#include "model_path.h"
 #include "opus.h"
 #include <math.h>
 #include "es8311.h"
@@ -250,7 +253,10 @@ static void i2s_music(void *args)
 #define AEC_CHIME_H2_GAIN     0.33f     /* 2nd harmonic (octave) level */
 #define AEC_CHIME_H3_GAIN     0.12f     /* 3rd harmonic level */
 #define AEC_CHIME_NORM        (1.0f + AEC_CHIME_H2_GAIN + AEC_CHIME_H3_GAIN)
-#define AEC_BEEP_DISCARD_MS    200      /* discard mic after start-chime so the tone tail is not recorded */
+#define AEC_BEEP_DISCARD_MS    300      /* discard mic after start-chime so the tone tail is not recorded.
+                                        * Increased from 200 to 300ms: after playback-abort the I²S TX DMA
+                                        * still holds residual chime samples that keep playing from the speaker,
+                                        * so we need more discard frames to clear both DMA + acoustic tail. */
 
 /* VAD + OPUS framing. VAD runs on 8kHz downsampled audio (lighter workload). It now
  * decides REC stop: once speech is heard, AEC_VAD_SILENCE_END_MS of trailing silence
@@ -362,7 +368,11 @@ static void play_chime(i2s_chan_handle_t tx, i2s_chan_handle_t rx,
 
 /* Recording-start feedback: play the "start listening" chime, then discard
  * the mic frames that still carry the chime tail so it is not recorded.
- * ref_ster / mic_ster / chime_buf must each hold AEC_FRAME_BYTES bytes. */
+ * After playback-abort the I²S TX DMA may still hold residual audio samples
+ * from the previous playback session; we write silence to TX during the
+ * discard phase to flush those out, ensuring no chime tail bleeds into the
+ * recording. ref_ster / mic_ster / chime_buf must each hold AEC_FRAME_BYTES
+ * bytes. */
 static void aec_rec_start_feedback(i2s_chan_handle_t tx, i2s_chan_handle_t rx,
                                    int16_t *ref_ster, int16_t *mic_ster, int16_t *chime_buf)
 {
@@ -371,6 +381,8 @@ static void aec_rec_start_feedback(i2s_chan_handle_t tx, i2s_chan_handle_t rx,
     ESP_LOGI(TAG, "[aec] start chime done");
 
     const int discard_frames = (AEC_BEEP_DISCARD_MS + AEC_FRAME_MS - 1) / AEC_FRAME_MS;
+    /* Write silence to TX to flush any residual DMA data, and read RX to
+     * discard the chime tail captured by the microphone. */
     memset(ref_ster, 0, AEC_FRAME_BYTES);
     for (int d = 0; d < discard_frames; d++) {
         size_t bw = 0;
@@ -490,6 +502,53 @@ static void i2s_aec_demo(void *args)
     }
     ESP_LOGI(TAG, "[aec] AEC created (mode %d, %dms frame)", aec_mode, AEC_FRAME_MS);
 
+    /* Wake word detection (Hi Lexin / wn9_hilexin), loaded from flash "model"
+     * partition via esp_srmodel. Runs only in IDLE to start recording hands-free,
+     * alongside the BTN1 trigger. Graceful degradation: if any step fails the
+     * device falls back to BTN1-only recording (the existing behavior). */
+    const esp_wn_iface_t *wn_iface = NULL;
+    model_iface_data_t *wn_model = NULL;
+    int wn_chunksize = 0;
+    int16_t *wn_ring = NULL;
+    int wn_ring_len = 0;
+    ESP_LOGI(TAG, "[wn] internal free before init: %u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    srmodel_list_t *sr_models = esp_srmodel_init("model");
+    if (sr_models) {
+        char *wn_name = esp_srmodel_filter(sr_models, ESP_WN_PREFIX, NULL); /* ESP_WN_PREFIX="wn" */
+        if (wn_name) {
+            wn_iface = esp_wn_handle_from_name(wn_name);
+            if (wn_iface) {
+                wn_model = wn_iface->create(wn_name, DET_MODE_90);
+                if (wn_model) {
+                    wn_chunksize = wn_iface->get_samp_chunksize(wn_model);
+                    wn_ring = heap_caps_malloc(wn_chunksize * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+                    if (wn_ring) {
+                        ESP_LOGI(TAG, "[wn] wakenet ready: %s, chunksize=%d rate=%d (internal free after=%u)",
+                                 wn_name, wn_chunksize, wn_iface->get_samp_rate(wn_model),
+                                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                    } else {
+                        ESP_LOGW(TAG, "[wn] wn_ring alloc failed, wakenet disabled (BTN1-only)");
+                        wn_iface->destroy(wn_model);
+                        wn_model = NULL;
+                        wn_iface = NULL;
+                        wn_chunksize = 0;
+                    }
+                } else {
+                    ESP_LOGW(TAG, "[wn] wakenet create failed (BTN1-only)");
+                    wn_iface = NULL;
+                }
+            } else {
+                ESP_LOGW(TAG, "[wn] no wakenet handle for '%s' (BTN1-only)", wn_name);
+            }
+        } else {
+            ESP_LOGW(TAG, "[wn] no wakenet model in partition (BTN1-only)");
+        }
+    } else {
+        ESP_LOGW(TAG, "[wn] esp_srmodel_init failed (BTN1-only recording)");
+    }
+
     /* VAD + OPUS encoder: voice-activity detection + compressed encoding demo.
      * VAD/OPUS use 20ms (320 samples @16kHz) frames; AEC uses 16ms (256), so we
      * accumulate AEC-cleaned audio into a ring buffer and feed 20ms slices. */
@@ -571,6 +630,7 @@ static void i2s_aec_demo(void *args)
     int64_t frame_start_us = 0;
     int64_t enc_start_us = 0;      /* encode start timestamp (pushed end-marker); for enc timing */
     bool btn_prev = false;         /* BTN1 level last frame (press-edge trigger) */
+    bool wake_triggered = false;   /* set by wakenet in IDLE, consumed as a REC trigger */
 
     /* VAD + OPUS state. opus encode counters live in s_enc (written by
      * opus_enc_task); opus_off is maintained by this recorder task. */
@@ -587,8 +647,9 @@ static void i2s_aec_demo(void *args)
         bool btn_press_edge = btn_now && !btn_prev;
 
         /* ---- PLAYBACK: play peak-normalized OPUS-decoded audio, then go idle.
-         * BTN1 aborts playback instantly, drops the recording and goes
-         * straight back to REC. ---- */
+         * BTN1 or wake word aborts playback instantly, drops the recording and goes
+         * straight back to REC. While playing, mic is captured and fed through AEC
+         * to remove the playback echo, then to WakeNet for hands-free interruption. ---- */
         if (state == 4) {
             ESP_LOGI(TAG, "[aec] playback start, %u samples (%u ms) gain=x%.2f",
                      (unsigned)s_enc.decode_samples,
@@ -596,6 +657,7 @@ static void i2s_aec_demo(void *args)
                      (double)play_gain);
             size_t played = 0;
             bool aborted = false;
+            wn_ring_len = 0;  /* reset wakenet ring so leftover IDLE audio doesn't trigger */
             while (played < s_enc.decode_samples) {
                 /* Poll BTN1 every frame (~16ms) so playback can be interrupted */
                 if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
@@ -607,6 +669,7 @@ static void i2s_aec_demo(void *args)
                 if (played + n > s_enc.decode_samples) {
                     n = s_enc.decode_samples - played;
                 }
+                /* Build stereo playback frame */
                 for (size_t j = 0; j < n; j++) {
                     float fv = (float)decode_buf[played + j] * play_gain;
                     if (fv > 32767.0f) {
@@ -619,14 +682,70 @@ static void i2s_aec_demo(void *args)
                     play_ster[2 * j] = sv;
                     play_ster[2 * j + 1] = sv;
                 }
-                size_t bw = 0;
-                esp_err_t ret = i2s_channel_write(tx_handle, play_ster, n * 2 * sizeof(int16_t),
-                                                  &bw, 1000);
+                /* Zero-pad remaining samples if last frame is short */
+                for (size_t j = n; j < AEC_FRAME_SAMPLES; j++) {
+                    play_ster[2 * j] = 0;
+                    play_ster[2 * j + 1] = 0;
+                }
+
+                /* Write audio to speaker AND simultaneously read mic from I²S.
+                 * The blocking write + read gives us a full-duplex frame: speaker
+                 * plays while mic captures, so AEC has a real reference to cancel. */
+                size_t bw = 0, br = 0;
+                esp_err_t ret = i2s_channel_write(tx_handle, play_ster, AEC_FRAME_BYTES, &bw, 1000);
                 if (ret != ESP_OK) {
                     ESP_LOGE(TAG, "[aec] playback write failed: %s", esp_err_to_name(ret));
                     break;
                 }
+                /* Read mic during playback for wake-word detection */
+                ret = i2s_channel_read(rx_handle, mic_ster, AEC_FRAME_BYTES, &br, 1000);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "[aec] playback mic read failed: %s", esp_err_to_name(ret));
+                } else {
+                    /* Extract mono mic (left channel) */
+                    for (int j = 0; j < AEC_FRAME_SAMPLES; j++) {
+                        mic_mono[j] = mic_ster[2 * j];
+                    }
+                    /* Build mono reference from what we just played */
+                    for (int j = 0; j < AEC_FRAME_SAMPLES; j++) {
+                        ref_mono[j] = play_ster[2 * j];
+                    }
+                    /* Run AEC: remove playback echo from mic signal */
+                    aec_process(aec, mic_mono, ref_mono, out_mono);
+
+                    /* Feed AEC-cleaned audio to WakeNet for hands-free interrupt */
+                    if (wn_iface && wn_model && wn_ring) {
+                        int copied = 0;
+                        while (copied < AEC_FRAME_SAMPLES) {
+                            int space = wn_chunksize - wn_ring_len;
+                            int cn = AEC_FRAME_SAMPLES - copied;
+                            if (cn > space) {
+                                cn = space;
+                            }
+                            memcpy(wn_ring + wn_ring_len, out_mono + copied, cn * sizeof(int16_t));
+                            wn_ring_len += cn;
+                            copied += cn;
+                            while (wn_ring_len >= wn_chunksize) {
+                                wakenet_state_t wr = wn_iface->detect(wn_model, wn_ring);
+                                if (wr == WAKENET_DETECTED) {
+                                    ESP_LOGI(TAG, "[wn] wake word detected during playback, aborting playback");
+                                    aborted = true;
+                                    break;
+                                }
+                                memmove(wn_ring, wn_ring + wn_chunksize,
+                                        (wn_ring_len - wn_chunksize) * sizeof(int16_t));
+                                wn_ring_len -= wn_chunksize;
+                            }
+                            if (aborted) {
+                                break;
+                            }
+                        }
+                    }
+                }
                 played += n;
+                if (aborted) {
+                    break;
+                }
             }
             if (aborted) {
                 /* Flush queued playback samples so the speaker goes silent NOW,
@@ -635,6 +754,7 @@ static void i2s_aec_demo(void *args)
                 i2s_channel_enable(tx_handle);
                 if (s_enc.queue) { xQueueReset(s_enc.queue); }
                 if (s_enc.done_sem) { xSemaphoreTake(s_enc.done_sem, 0); } /* clear stale done */
+                wn_ring_len = 0;  /* clear wakenet ring after playback abort */
                 state = 1;
                 rec_samples = 0;
                 frame_cnt = 0;
@@ -652,6 +772,7 @@ static void i2s_aec_demo(void *args)
             }
             ESP_LOGI(TAG, "[aec] playback done, %u samples", (unsigned)played);
             /* OPUS was already batch-encoded before playback; go back to IDLE. */
+            wn_ring_len = 0;  /* clear wakenet ring for clean IDLE re-entry */
             state = 0;
             idle_cnt = 0;
             continue;
@@ -762,12 +883,49 @@ static void i2s_aec_demo(void *args)
                 enc_start_us = esp_timer_get_time();
                 state = 2;
             }
-        } else if (state == 0) { /* IDLE: silent, wait for BTN1 press-edge */
+        } else if (state == 0) { /* IDLE: silent, feed wakenet + wait for BTN1 press-edge */
             idle_cnt++;
             if ((idle_cnt % 375) == 0) {
-                ESP_LOGI(TAG, "[aec] idle (silent), ready - press BTN1 to record");
+                ESP_LOGI(TAG, "[aec] idle (silent), ready - say wake word or press BTN1 to record (stack free=%u)",
+                         (unsigned)uxTaskGetStackHighWaterMark(NULL));
             }
-            if (btn_press_edge) {
+
+            /* Feed wake word detector: accumulate this frame's mic_mono into wn_ring
+             * and run detect() on each full chunk. WAKENET_DETECTED arms
+             * wake_triggered, which triggers REC below exactly like a BTN1 press. */
+            if (wn_iface && wn_model && wn_ring) {
+                int copied = 0;
+                while (copied < AEC_FRAME_SAMPLES) {
+                    int space = wn_chunksize - wn_ring_len;
+                    int n = AEC_FRAME_SAMPLES - copied;
+                    if (n > space) {
+                        n = space;
+                    }
+                    memcpy(wn_ring + wn_ring_len, mic_mono + copied, n * sizeof(int16_t));
+                    wn_ring_len += n;
+                    copied += n;
+                    while (wn_ring_len >= wn_chunksize) {
+                        wakenet_state_t wr = wn_iface->detect(wn_model, wn_ring);
+                        if (wr == WAKENET_DETECTED) {
+                            wake_triggered = true;
+                        }
+                        memmove(wn_ring, wn_ring + wn_chunksize,
+                                (wn_ring_len - wn_chunksize) * sizeof(int16_t));
+                        wn_ring_len -= wn_chunksize;
+                        if (wake_triggered) {
+                            break;
+                        }
+                    }
+                    if (wake_triggered) {
+                        break;
+                    }
+                }
+            }
+
+            if (btn_press_edge || wake_triggered) {
+                if (wake_triggered) {
+                    ESP_LOGI(TAG, "[wn] wake word detected, starting recording");
+                }
                 state = 1;
                 rec_samples = 0;
                 frame_cnt = 0;
@@ -783,6 +941,12 @@ static void i2s_aec_demo(void *args)
                     xQueueReset(s_enc.queue);
                 }
                 if (s_enc.done_sem) { xSemaphoreTake(s_enc.done_sem, 0); } /* clear stale done */
+                /* reset wakenet ring buffer. NOTE: wn_iface->clean() is NOT called - it
+                 * dereferences a NULL conv-queue buffer (a model buffer failed to allocate
+                 * under internal-RAM heap fragmentation); detect's streaming state
+                 * self-refreshes, and only IDLE feeds wakenet so playback can't re-trigger. */
+                wake_triggered = false;
+                wn_ring_len = 0;
                 ESP_LOGI(TAG, "[aec] recording start (AEC off, raw mic) - VAD will stop");
                 aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
                 rec_start_us = esp_timer_get_time();
@@ -836,7 +1000,7 @@ static void i2s_aec_demo(void *args)
 #define AI_MIRROR_BOOT_DECISION_WINDOW_MS  3500
 #define AI_MIRROR_WIFI_CONNECT_TIMEOUT_MS  20000
 #define AI_MIRROR_INTERNET_TIMEOUT_MS      6000
-#define AI_MIRROR_LVGL_BUFFER_LINES        40
+#define AI_MIRROR_LVGL_BUFFER_LINES        10
 
 /* Product-default behavior: missing saved Wi-Fi forces provisioning.
  * If you really want saved Wi-Fi to also force provisioning at every boot, flip this to 1. */

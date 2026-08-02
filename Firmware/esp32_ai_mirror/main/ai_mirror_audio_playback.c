@@ -9,7 +9,7 @@
 
 /* Samples live in PSRAM; queues only store ownership descriptors. */
 #define PLAYBACK_QUEUE_DEPTH 8
-#define STREAM_QUEUE_DEPTH 16
+#define STREAM_QUEUE_DEPTH 128
 #define STREAM_CHUNK_SAMPLES 2048
 
 static QueueHandle_t s_playback_queue;
@@ -164,7 +164,7 @@ esp_err_t ai_mirror_audio_playback_stream_write_bytes(const uint8_t *data,
             s_stream_error = true;
             return ESP_ERR_INVALID_SIZE;
         }
-        if (xQueueSend(s_stream_queue, &chunk, pdMS_TO_TICKS(1000)) != pdPASS) {
+        if (xQueueSend(s_stream_queue, &chunk, pdMS_TO_TICKS(2000)) != pdPASS) {
             heap_caps_free(chunk.samples);
             s_stream_error = true;
             return ESP_ERR_TIMEOUT;
@@ -194,7 +194,7 @@ esp_err_t ai_mirror_audio_playback_stream_write_bytes(const uint8_t *data,
             .samples = samples,
             .sample_count = count,
         };
-        if (xQueueSend(s_stream_queue, &chunk, pdMS_TO_TICKS(1000)) != pdPASS) {
+        if (xQueueSend(s_stream_queue, &chunk, pdMS_TO_TICKS(2000)) != pdPASS) {
             heap_caps_free(samples);
             s_stream_error = true;
             return ESP_ERR_TIMEOUT;

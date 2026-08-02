@@ -70,6 +70,12 @@ extern void ai_mirror_ui_show_internet_warning(lv_disp_t *disp, bool retry_selec
 #define AI_MIRROR_PIN_NUM_BK_LIGHT       2
 #define AI_MIRROR_PIN_NUM_TOUCH_CS       15
 
+/* The AEC/WakeNet/playback loop has a deeper call chain than the idle path.
+ * Keep a larger stack in internal RAM: WakeNet model initialization maps the
+ * model partition while temporarily disabling flash caches, which is unsafe
+ * when the current task stack lives in PSRAM. The *_WithCaps API takes bytes. */
+#define AI_MIRROR_AEC_TASK_STACK_BYTES   6144
+
 #define AI_MIRROR_LCD_H_RES              240
 #define AI_MIRROR_LCD_V_RES              240
 #define AI_MIRROR_LCD_CMD_BITS           8
@@ -125,8 +131,35 @@ static esp_err_t es8311_codec_init(void)
         .sample_frequency = AI_MIRROR_SAMPLE_RATE
     };
 
-    ESP_RETURN_ON_ERROR(es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16), TAG, "es8311 init failed");
-    ESP_RETURN_ON_ERROR(es8311_sample_frequency_config(es_handle, AI_MIRROR_SAMPLE_RATE * AI_MIRROR_MCLK_MULTIPLE, AI_MIRROR_SAMPLE_RATE), TAG, "set es8311 sample frequency failed");
+    esp_err_t codec_init_ret = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        codec_init_ret = es8311_init(
+            es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
+        if (codec_init_ret == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "es8311 init failed (attempt %d, 0x%x)",
+                 attempt + 1, codec_init_ret);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_RETURN_ON_ERROR(codec_init_ret, TAG, "es8311 init failed");
+    /* The codec can NACK the first clock-register transaction while its
+     * analog block is leaving reset. Retry the bounded, idempotent operation
+     * so a transient I2C error does not disable the whole audio task. */
+    esp_err_t sample_frequency_ret = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        sample_frequency_ret = es8311_sample_frequency_config(
+            es_handle,
+            AI_MIRROR_SAMPLE_RATE * AI_MIRROR_MCLK_MULTIPLE,
+            AI_MIRROR_SAMPLE_RATE);
+        if (sample_frequency_ret == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "set es8311 sample frequency failed (attempt %d, 0x%x)",
+                 attempt + 1, sample_frequency_ret);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_RETURN_ON_ERROR(sample_frequency_ret, TAG, "set es8311 sample frequency failed");
     ESP_RETURN_ON_ERROR(es8311_voice_volume_set(es_handle, AI_MIRROR_VOICE_VOLUME, NULL), TAG, "set es8311 volume failed");
     ESP_RETURN_ON_ERROR(es8311_microphone_config(es_handle, false), TAG, "set es8311 microphone failed");
 #if CONFIG_AI_MIRROR_AUDIO_MODE_ECHO
@@ -358,6 +391,15 @@ static const aec_chime_note_t s_chime_end[] = {
     { 659.25f, 170 },
 };
 
+/* user speech end: G5 -> E5 -> G5, a short three-note acknowledgement.  The
+ * up/down/up contour is intentionally different from both the rising
+ * two-note start chime and the falling two-note session-end chime. */
+static const aec_chime_note_t s_chime_speech_end[] = {
+    { 783.99f, 60 },
+    { 659.25f, 60 },
+    { 783.99f, 120 },
+};
+
 static inline uint32_t aec_mean_abs(const int16_t *data, int n)
 {
     uint32_t acc = 0;
@@ -478,6 +520,29 @@ static void aec_session_end_feedback(i2s_chan_handle_t tx,
         i2s_channel_read(rx, chime_buf, AEC_FRAME_BYTES, &br, 1000);
     }
     ESP_LOGI(TAG, "[session] end chime done");
+}
+
+/* Local prompt for the end of one user utterance.  This is deliberately kept
+ * on the ESP32 so it is immediate and cannot be delayed by ASR/LLM/TTS.  Drain
+ * the acoustic tail afterwards so the prompt is not included in the next
+ * recording or wake-word window. */
+static void aec_speech_end_feedback(i2s_chan_handle_t tx,
+                                    i2s_chan_handle_t rx,
+                                    int16_t *chime_buf)
+{
+    play_chime(tx, rx, chime_buf, s_chime_speech_end,
+               sizeof(s_chime_speech_end) / sizeof(s_chime_speech_end[0]));
+
+    const int discard_frames =
+        (AEC_BEEP_DISCARD_MS + AEC_FRAME_MS - 1) / AEC_FRAME_MS;
+    for (int d = 0; d < discard_frames; d++) {
+        size_t bw = 0;
+        memset(chime_buf, 0, AEC_FRAME_BYTES);
+        i2s_channel_write(tx, chime_buf, AEC_FRAME_BYTES, &bw, 1000);
+        size_t br = 0;
+        i2s_channel_read(rx, chime_buf, AEC_FRAME_BYTES, &br, 1000);
+    }
+    ESP_LOGI(TAG, "[aec] speech-end prompt chime done");
 }
 
 /* OPUS encode context shared between the recording task and the async
@@ -1038,8 +1103,12 @@ static void i2s_aec_demo(void *args)
             }
             uint32_t playback_ms = (uint32_t)((esp_timer_get_time() - playback_started_us) / 1000);
             if (failed) {
+                const char *failure_reason =
+                    playback.streaming && ai_mirror_audio_playback_stream_has_error()
+                        ? "stream transport or playback queue error"
+                        : "I2S write failed";
                 ai_mirror_gateway_report_playback(
-                    playback.command_id, "playback_failed", playback_ms, "I2S write failed");
+                    playback.command_id, "playback_failed", playback_ms, failure_reason);
             } else {
                 ai_mirror_gateway_report_playback(
                     playback.command_id, "playback_completed", playback_ms, "");
@@ -1188,6 +1257,9 @@ static void i2s_aec_demo(void *args)
                 }
                 if (gateway_err != ESP_OK) {
                     ESP_LOGW(TAG, "[gateway] recording upload skipped: %s", esp_err_to_name(gateway_err));
+                }
+                if (vad_end) {
+                    aec_speech_end_feedback(tx_handle, rx_handle, chime_buf);
                 }
                 {                     int64_t rec_wall_us = esp_timer_get_time() - rec_start_us;                     uint32_t rec_wall_ms = (uint32_t)(rec_wall_us / 1000);                     uint32_t expected_ms = (uint32_t)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE);                     ESP_LOGI(TAG, "[aec] diag: rec wall=%ums expected16k=%ums ratio=%.2f", (unsigned)rec_wall_ms, (unsigned)expected_ms, rec_wall_ms ? (double)expected_ms / (double)rec_wall_ms : 0.0);                 }
                 /* Push end-marker: opus_enc_task finishes the last queued frames,
@@ -1818,8 +1890,8 @@ static void ai_mirror_audio_start(bool audio_ok)
         ESP_LOGI(TAG, "[aec] internal free heap before xTaskCreate: %u bytes",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         BaseType_t xret = xTaskCreatePinnedToCoreWithCaps(
-            i2s_aec_demo, "aec_demo", 3584, NULL, 5, NULL, 1,
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            i2s_aec_demo, "aec_demo", AI_MIRROR_AEC_TASK_STACK_BYTES,
+            NULL, 5, NULL, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (xret != pdPASS) {
             ESP_LOGE(TAG, "[aec] xTaskCreate FAILED (ret=%d), task not started", (int)xret);
         } else {

@@ -224,7 +224,12 @@ static void gateway_command_websocket_event(void *handler_args,
     }
 
     uint8_t opcode = (uint8_t)(data->op_code & 0x0F);
-    if (data->payload_offset == 0) {
+    /* Do not log every binary PCM frame at INFO.  A long response contains
+     * hundreds of frames; formatting and UART output from the WebSocket event
+     * task can starve the AEC playback task and make the bounded PCM queue
+     * appear to stop draining.  Keep control-frame logs, while binary frame
+     * failures are still logged below. */
+    if (data->payload_offset == 0 && opcode != 2) {
         ESP_LOGI(TAG, "command WebSocket RX: opcode=0x%02x fin=%d len=%d payload=%d",
                  (unsigned)opcode, data->fin ? 1 : 0, data->data_len,
                  data->payload_len);
@@ -777,12 +782,19 @@ esp_err_t ai_mirror_gateway_start(void)
         const esp_websocket_client_config_t command_config = {
             .uri = s_command_ws_url,
             .task_name = "gateway_cmd_ws",
-            .task_stack = 4096,
+            .task_stack = 6144,
             .buffer_size = 4096,
             .headers = s_command_ws_headers,
             .reconnect_timeout_ms = 2000,
-            .network_timeout_ms = CONFIG_AI_MIRROR_GATEWAY_HTTP_TIMEOUT_MS,
-            .ping_interval_sec = 60,
+            /* Keep PCM ingest below the AEC task priority.  The event callback
+             * may wait for a bounded playback queue slot; playback must keep
+             * draining that queue while the network task is back-pressured. */
+            .task_prio = 4,
+            /* Long PCM streams can briefly occupy the event task while the
+             * playback queue catches up.  Keep the persistent command socket
+             * alive long enough to receive the final audio_stream_end frame. */
+            .network_timeout_ms = 60000,
+            .ping_interval_sec = 10,
             .disable_pingpong_discon = true,
         };
         s_command_ws_client = esp_websocket_client_init(&command_config);

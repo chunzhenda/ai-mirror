@@ -94,6 +94,6 @@ menu "AI Mirror Configuration"
     config AI_MIRROR_GATEWAY_HTTP_TIMEOUT_MS
         int "Gateway HTTP timeout (ms)"
         range 1000 60000
-        default 15000
+        default 60000
         depends on AI_MIRROR_GATEWAY_ENABLE
 endmenu

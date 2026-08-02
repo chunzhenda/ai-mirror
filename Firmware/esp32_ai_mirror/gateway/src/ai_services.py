@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
 import json
 import os
 import queue
@@ -22,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
+
+from .maintenance import cleanup_tree
+from .resilience import RetryPolicy, is_transient_error, run_with_retry
 
 
 def utc_now() -> str:
@@ -198,9 +202,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tts_sentence_streaming_enabled": True,
     "tts_sentence_max_chars": 80,
     "tts_streaming_audio_enabled": True,
+    # The ESP32 now plays a local end-of-speech prompt chime. Keep the cloud
+    # acknowledgement opt-in so one utterance does not produce two prompts;
+    # the web setting can still re-enable the legacy fixed TTS reply.
+    "end_of_speech_reply_enabled": False,
+    "end_of_speech_reply_text": "好的，我听到了。",
     "voice_reply_max_sentences": 2,
     "voice_reply_max_chars": 160,
     "command_websocket_enabled": True,
+    "retry_max_attempts": 2,
+    "retry_base_delay_ms": 250,
+    "retry_max_delay_ms": 2000,
+    "recording_retention_hours": 168,
+    "tts_retention_hours": 24,
+    "temporary_retention_minutes": 60,
+    "storage_max_bytes": 2 * 1024 * 1024 * 1024,
+    "health_stale_device_seconds": 30,
+    "turn_stale_timeout_seconds": 900,
+    "worker_heartbeat_timeout_seconds": 15,
     "system_prompt": (
         "你是 AI Mirror 的语音助手。请使用简洁、自然的中文回答，"
         "优先给出直接结论，适合在语音交互界面中阅读。"
@@ -310,7 +329,12 @@ class GatewayDatabase:
                     component TEXT NOT NULL,
                     message TEXT NOT NULL,
                     details_json TEXT NOT NULL DEFAULT '{}',
-                    turn_id TEXT
+                    turn_id TEXT,
+                    request_id TEXT,
+                    command_id TEXT,
+                    device_id TEXT,
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    elapsed_ms INTEGER
                 );
                 """
             )
@@ -339,6 +363,24 @@ class GatewayDatabase:
                 if column not in existing:
                     self._connection.execute(
                         f"ALTER TABLE conversation_turns ADD COLUMN {column} {declaration}"
+                    )
+            existing_log_columns = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(gateway_logs)"
+                ).fetchall()
+            }
+            log_migrations = {
+                "request_id": "TEXT",
+                "command_id": "TEXT",
+                "device_id": "TEXT",
+                "attempt": "INTEGER NOT NULL DEFAULT 1",
+                "elapsed_ms": "INTEGER",
+            }
+            for column, declaration in log_migrations.items():
+                if column not in existing_log_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE gateway_logs ADD COLUMN {column} {declaration}"
                     )
 
     def _seed_config(self) -> None:
@@ -380,6 +422,79 @@ class GatewayDatabase:
         with self._lock:
             self._connection.close()
 
+    def health_check(self) -> tuple[bool, str]:
+        try:
+            with self._lock:
+                self._connection.execute("SELECT 1").fetchone()
+            return True, "ok"
+        except sqlite3.Error as error:
+            return False, str(error)[:200]
+
+    def active_turns(self) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in ConversationService.ACTIVE_TURN_STATUSES)
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT * FROM conversation_turns WHERE status IN ({placeholders})",
+                tuple(ConversationService.ACTIVE_TURN_STATUSES),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recover_stale_turns(
+        self, statuses: set[str], max_age_seconds: float, error_message: str
+    ) -> list[dict[str, Any]]:
+        """Mark turns left in an in-progress state by a dead worker as failed.
+
+        A gateway restart cannot resume a remote playback command safely.  The
+        recovery is therefore deliberately conservative: only turns whose last
+        update is older than the configured grace period are changed.
+        """
+        if not statuses:
+            return []
+        now = datetime.now(timezone.utc)
+        stale_ids: list[str] = []
+        status_values = tuple(statuses)
+        with self._lock:
+            placeholders = ",".join("?" for _ in status_values)
+            rows = self._connection.execute(
+                f"SELECT id, status, created_at, updated_at FROM conversation_turns "
+                f"WHERE status IN ({placeholders})",
+                status_values,
+            ).fetchall()
+            for row in rows:
+                timestamp = row["updated_at"] or row["created_at"]
+                try:
+                    updated_at = datetime.fromisoformat(str(timestamp))
+                    if updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    # An invalid timestamp should not make the worker crash. It
+                    # is safer to leave that turn for the next maintenance pass.
+                    continue
+                if (now - updated_at).total_seconds() >= max_age_seconds:
+                    stale_ids.append(str(row["id"]))
+            if stale_ids:
+                with self._connection:
+                    self._connection.executemany(
+                        """
+                        UPDATE conversation_turns
+                        SET status='failed', error_message=?, updated_at=?
+                        WHERE id=? AND status IN ({})
+                        """.format(placeholders),
+                        [
+                            (error_message, utc_now(), turn_id, *status_values)
+                            for turn_id in stale_ids
+                        ],
+                    )
+                recovered = self._connection.execute(
+                    "SELECT * FROM conversation_turns "
+                    "WHERE id IN ({}) AND status='failed' AND error_message=?".format(
+                        ",".join("?" for _ in stale_ids)
+                    ),
+                    (*stale_ids, error_message),
+                ).fetchall()
+                return [dict(row) for row in recovered]
+        return []
+
     def config(self, include_secret: bool = False) -> dict[str, Any]:
         with self._lock:
             rows = self._connection.execute(
@@ -414,6 +529,7 @@ class GatewayDatabase:
             "streaming_asr_enabled",
             "tts_sentence_streaming_enabled",
             "tts_streaming_audio_enabled",
+            "end_of_speech_reply_enabled",
             "command_websocket_enabled",
         ):
             if key in payload:
@@ -430,6 +546,7 @@ class GatewayDatabase:
             ("unisound_tts_model", 200),
             ("unisound_tts_voice", 200),
             ("system_prompt", 4000),
+            ("end_of_speech_reply_text", 200),
         ):
             if key in payload:
                 value = payload[key]
@@ -512,6 +629,16 @@ class GatewayDatabase:
             "history_turns": (0, 20, int),
             "tts_rate": (-100, 100, int),
             "tts_volume": (-100, 100, int),
+            "retry_max_attempts": (1, 3, int),
+            "retry_base_delay_ms": (0, 5000, int),
+            "retry_max_delay_ms": (0, 30000, int),
+            "recording_retention_hours": (1, 24 * 365, int),
+            "tts_retention_hours": (1, 24 * 365, int),
+            "temporary_retention_minutes": (5, 24 * 60, int),
+            "storage_max_bytes": (64 * 1024 * 1024, 64 * 1024 * 1024 * 1024, int),
+            "health_stale_device_seconds": (5, 3600, int),
+            "turn_stale_timeout_seconds": (60, 24 * 3600, int),
+            "worker_heartbeat_timeout_seconds": (5, 300, int),
         }
         for key, (minimum, maximum, number_type) in numeric_rules.items():
             if key not in payload:
@@ -705,16 +832,37 @@ class GatewayDatabase:
         message: str,
         details: dict[str, Any] | None = None,
         turn_id: str | None = None,
+        *,
+        request_id: str | None = None,
+        command_id: str | None = None,
+        device_id: str | None = None,
+        attempt: int = 1,
+        elapsed_ms: int | None = None,
     ) -> dict[str, Any]:
         created_at = utc_now()
         details_json = json.dumps(details or {}, ensure_ascii=False, separators=(",", ":"))
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 """
-                INSERT INTO gateway_logs(created_at, level, component, message, details_json, turn_id)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO gateway_logs(
+                    created_at, level, component, message, details_json, turn_id,
+                    request_id, command_id, device_id, attempt, elapsed_ms
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (created_at, level.upper()[:16], component[:64], message[:2000], details_json, turn_id),
+                (
+                    created_at,
+                    level.upper()[:16],
+                    component[:64],
+                    message[:2000],
+                    details_json,
+                    turn_id,
+                    request_id,
+                    command_id,
+                    device_id,
+                    max(1, int(attempt)),
+                    elapsed_ms,
+                ),
             )
             log_id = cursor.lastrowid
             self._connection.execute(
@@ -728,6 +876,11 @@ class GatewayDatabase:
             "message": message[:2000],
             "details": details or {},
             "turn_id": turn_id,
+            "request_id": request_id,
+            "command_id": command_id,
+            "device_id": device_id,
+            "attempt": max(1, int(attempt)),
+            "elapsed_ms": elapsed_ms,
         }
 
     def logs(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -830,7 +983,12 @@ class _TTSStreamingCoordinator:
             filename = f"{self.turn_id}-chunk-{index}.pcm"
             pcm_path = self.service.tts_dir / filename
             future = self.service._tts_executor.submit(
-                self.service._run_tts, cleaned, pcm_path, self.config
+                self.service._run_stage_with_retry,
+                "tts",
+                lambda: self.service._run_tts(cleaned, pcm_path, self.config),
+                self.config,
+                turn_id=self.turn_id,
+                cleanup_path=pcm_path,
             )
             self._futures.append((index, cleaned, pcm_path, future))
             self._condition.notify_all()
@@ -905,10 +1063,17 @@ class _TTSStreamingCoordinator:
                 audio = future.result()
                 command_id, completion = self._queue_audio(index, text, pcm_path, audio)
                 if completion is not None:
-                    timeout = max(
-                        30,
-                        int(self.config.get("tts_api_timeout_seconds", 60)),
-                    )
+                    # The device acknowledgement deadline follows the actual
+                    # audio duration.  A fixed 30/60 second wait leaves a
+                    # failed turn hanging for too long when the ESP32 is
+                    # offline, while a short sentence should fail quickly.
+                    # The gateway deliberately sends PCM slightly slower than
+                    # real time to protect the ESP32's bounded stream queue.
+                    # Include that pacing margin in the acknowledgement
+                    # deadline; otherwise a legitimate long answer can time
+                    # out while its final frames are still in flight.
+                    duration_seconds = float(audio["duration_ms"]) / 1000
+                    timeout = min(300, max(10, duration_seconds * 1.25 + 8))
                     if not completion["event"].wait(timeout):
                         raise RuntimeError(
                             f"等待 ESP32 播放完成超时: command_id={command_id}"
@@ -985,6 +1150,18 @@ class _TTSStreamingCoordinator:
 
 
 class ConversationService:
+    MAX_PENDING_TURNS = 100
+    ACTIVE_TURN_STATUSES = {
+        "pending",
+        "transcribing",
+        "transcript_ready",
+        "llm_generating",
+        "llm_ready",
+        "tts_synthesizing",
+        "playback_queued",
+        "playing",
+    }
+
     def __init__(
         self,
         data_dir: Path,
@@ -1006,7 +1183,7 @@ class ConversationService:
         self._model: Any = None
         self._model_key: tuple[str, str] | None = None
         self._asr_lock = threading.RLock()
-        self._jobs: queue.Queue[str | None] = queue.Queue()
+        self._jobs: queue.Queue[str | None] = queue.Queue(maxsize=self.MAX_PENDING_TURNS)
         self._queued: set[str] = set()
         self._queued_lock = threading.Lock()
         self._subscribers: set[queue.Queue[dict[str, Any]]] = set()
@@ -1018,6 +1195,9 @@ class ConversationService:
         self._tts_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="gateway-tts"
         )
+        self._end_reply_lock = threading.RLock()
+        self._end_reply_cached_key = ""
+        self._end_reply_cache: tuple[str, dict[str, int]] | None = None
         self._stream_partial_lock = threading.RLock()
         self._stream_partial_jobs: dict[str, tuple[Future[str], Path]] = {}
         self._playback_turns: dict[str, dict[str, Any]] = {}
@@ -1026,27 +1206,79 @@ class ConversationService:
         self._playback_turns_lock = threading.RLock()
         self._closed = False
         self._asr_preload_error: str | None = None
+        self._worker_heartbeat = time.monotonic()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._active_turns: set[str] = set()
+        self._active_turns_lock = threading.RLock()
 
     def set_playback_sender(self, sender: PlaybackSender) -> None:
         self._playback_sender = sender
 
+    def recover_stale_turns(self) -> int:
+        config = self.database.config(include_secret=True)
+        timeout_seconds = max(
+            60, int(config.get("turn_stale_timeout_seconds", 900))
+        )
+        recovered = self.database.recover_stale_turns(
+            self.ACTIVE_TURN_STATUSES,
+            timeout_seconds,
+            "gateway recovered a stale in-progress turn after timeout",
+        )
+        for turn in recovered:
+            self.log(
+                "WARN",
+                "pipeline",
+                "stale conversation turn recovered",
+                {
+                    "status": turn.get("status"),
+                    "timeout_seconds": timeout_seconds,
+                    "recording_id": turn.get("recording_id"),
+                },
+                turn_id=turn.get("id"),
+                device_id=turn.get("device_id"),
+            )
+            self.publish("turn_updated", turn)
+        return len(recovered)
+
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
             return
+        self.recover_stale_turns()
         self._preload_sensevoice()
+        self._worker_heartbeat = time.monotonic()
         self._worker = threading.Thread(
             target=self._worker_loop, name="gateway-ai-worker", daemon=True
         )
         self._worker.start()
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="gateway-worker-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
+        if self.database.config(include_secret=True).get("auto_process"):
+            self.resume_waiting()
         self.log("INFO", "pipeline", "AI 后台处理线程已启动")
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._heartbeat_stop.set()
+        with self._playback_turns_lock:
+            for playback in self._playback_turns.values():
+                completion = playback.get("completion")
+                if isinstance(completion, dict):
+                    completion["error"] = "gateway shutting down"
+                    completion["event"].set()
         if self._worker and self._worker.is_alive():
-            self._jobs.put(None)
+            try:
+                self._jobs.put(None, timeout=1)
+            except queue.Full:
+                self.log("WARN", "pipeline", "worker shutdown queue is full")
             self._worker.join(timeout=5)
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=2)
         self._stream_executor.shutdown(wait=False, cancel_futures=True)
         self._tts_executor.shutdown(wait=False, cancel_futures=True)
         self.database.close()
@@ -1061,6 +1293,99 @@ class ConversationService:
         config["sensevoice_loaded"] = self._model is not None
         config["sensevoice_preload_error"] = self._asr_preload_error or ""
         return config
+
+    def health_snapshot(self) -> dict[str, Any]:
+        config = self.database.config(include_secret=True)
+        database_ok, database_error = self.database.health_check()
+        heartbeat_age = max(0.0, time.monotonic() - self._worker_heartbeat)
+        worker_ok = self.worker_running and heartbeat_age <= float(
+            config.get("worker_heartbeat_timeout_seconds", 15)
+        )
+        model_ok = config.get("asr_provider") != "sensevoice_local" or self._model is not None
+        ready = database_ok and worker_ok and model_ok
+        return {
+            "ok": ready,
+            "ready": ready,
+            "ai_worker_running": self.worker_running,
+            "worker_heartbeat_age_seconds": round(heartbeat_age, 3),
+            "sensevoice_loaded": self._model is not None,
+            "database_ok": database_ok,
+            "database_error": database_error,
+            "queue_depth": self._jobs.qsize(),
+            "queue_capacity": self.MAX_PENDING_TURNS,
+            "active_turns": len(self.active_turn_ids()),
+            "checks": {
+                "worker": worker_ok,
+                "sensevoice": model_ok,
+                "database": database_ok,
+            },
+        }
+
+    def active_turn_ids(self) -> set[str]:
+        with self._active_turns_lock:
+            active = set(self._active_turns)
+        try:
+            active.update(turn["id"] for turn in self.database.active_turns())
+        except sqlite3.Error:
+            pass
+        return active
+
+    def active_recording_ids(self) -> set[str]:
+        return {
+            str(turn["recording_id"])
+            for turn in self.database.active_turns()
+            if turn.get("recording_id")
+        }
+
+    def cleanup_artifacts(
+        self,
+        *,
+        config: dict[str, Any] | None = None,
+        protected_turn_ids: set[str] | None = None,
+    ) -> dict[str, int]:
+        config = config or self.database.config(include_secret=True)
+        protected = protected_turn_ids or set()
+        tts_result = cleanup_tree(
+            self.tts_dir,
+            max_age_seconds=max(3600, int(config.get("tts_retention_hours", 24)) * 3600),
+            protected_names={
+                f"{turn_id}.pcm"
+                for turn_id in protected
+            },
+            protected_prefixes=tuple(f"{turn_id}-chunk-" for turn_id in protected),
+        )
+        tts_temp_result = cleanup_tree(
+            self.tts_dir,
+            max_age_seconds=max(
+                300,
+                int(config.get("temporary_retention_minutes", 60)) * 60,
+            ),
+            allowed_suffixes={".tmp", ".mp3"},
+        )
+        stream_result = cleanup_tree(
+            self.stream_dir,
+            max_age_seconds=max(
+                300,
+                int(config.get("temporary_retention_minutes", 60)) * 60,
+            ),
+        )
+        return {
+            "deleted_files": (
+                tts_result["deleted_files"]
+                + tts_temp_result["deleted_files"]
+                + stream_result["deleted_files"]
+            ),
+            "deleted_bytes": (
+                tts_result["deleted_bytes"]
+                + tts_temp_result["deleted_bytes"]
+                + stream_result["deleted_bytes"]
+            ),
+            "errors": (
+                tts_result["errors"]
+                + tts_temp_result["errors"]
+                + stream_result["errors"]
+            ),
+        }
 
     def streaming_asr_supported(self) -> bool:
         config = self.database.config(include_secret=True)
@@ -1188,8 +1513,25 @@ class ConversationService:
         message: str,
         details: dict[str, Any] | None = None,
         turn_id: str | None = None,
+        *,
+        request_id: str | None = None,
+        command_id: str | None = None,
+        device_id: str | None = None,
+        attempt: int = 1,
+        elapsed_ms: int | None = None,
     ) -> dict[str, Any]:
-        entry = self.database.add_log(level, component, message, details, turn_id)
+        entry = self.database.add_log(
+            level,
+            component,
+            message,
+            details,
+            turn_id,
+            request_id=request_id,
+            command_id=command_id,
+            device_id=device_id,
+            attempt=attempt,
+            elapsed_ms=elapsed_ms,
+        )
         safe_console_print(
             f"[{entry['created_at']}] {entry['level']} {component}: {message}"
         )
@@ -1230,9 +1572,130 @@ class ConversationService:
             turn["id"],
         )
         self.publish("turn_updated", turn)
-        if self.database.config(include_secret=True).get("auto_process"):
+        config = self.database.config(include_secret=True)
+        # Queue a short acknowledgement before the ASR/LLM pipeline.  This is
+        # intentionally synchronous on the first use so the acknowledgement
+        # command is ordered ahead of the eventual LLM playback command; the
+        # generated PCM is cached and subsequent turns do not pay TTS latency.
+        self._queue_end_of_speech_reply(recording, config)
+        if config.get("auto_process"):
             self.enqueue(turn["id"])
         return turn
+
+    @staticmethod
+    def _end_reply_cache_key(config: dict[str, Any], text: str) -> str:
+        relevant = {
+            "text": text,
+            "tts_provider": config.get("tts_provider", ""),
+            "tts_voice": config.get("tts_voice", ""),
+            "unisound_tts_model": config.get("unisound_tts_model", ""),
+            "unisound_tts_voice": config.get("unisound_tts_voice", ""),
+            "tts_rate": config.get("tts_rate", 0),
+            "tts_volume": config.get("tts_volume", 0),
+            "tts_prompt": config.get("tts_prompt", ""),
+            "tts_api_url": config.get("tts_api_url", ""),
+            "tts_api_model": config.get("tts_api_model", ""),
+        }
+        serialized = json.dumps(relevant, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _pcm_file_metadata(path: Path) -> dict[str, int]:
+        size_bytes = path.stat().st_size
+        if size_bytes <= 0 or size_bytes % 2:
+            raise RuntimeError("固定结束提示音 PCM 文件无效")
+        sample_count = size_bytes // 2
+        return {
+            "sample_rate": 16000,
+            "sample_count": sample_count,
+            "duration_ms": round(sample_count * 1000 / 16000),
+        }
+
+    def _ensure_end_of_speech_reply_audio(
+        self, config: dict[str, Any]
+    ) -> tuple[str, dict[str, int]]:
+        text = _prepare_tts_text(str(config.get("end_of_speech_reply_text", "")))
+        if not text:
+            raise RuntimeError("结束提示语为空")
+        cache_key = self._end_reply_cache_key(config, text)
+        with self._end_reply_lock:
+            if self._end_reply_cached_key == cache_key and self._end_reply_cache:
+                return cache_key, dict(self._end_reply_cache[1])
+            pcm_path = self.tts_dir / f"{cache_key}-chunk-0.pcm"
+            try:
+                audio = self._pcm_file_metadata(pcm_path)
+            except (FileNotFoundError, OSError, RuntimeError):
+                audio = self._run_stage_with_retry(
+                    "tts",
+                    lambda: self._run_tts(text, pcm_path, config),
+                    config,
+                    cleanup_path=pcm_path,
+                )
+                if int(audio.get("sample_rate", 16000)) != 16000:
+                    raise RuntimeError("固定结束提示音必须是 16 kHz PCM")
+                audio = self._pcm_file_metadata(pcm_path)
+            self._end_reply_cached_key = cache_key
+            self._end_reply_cache = (cache_key, dict(audio))
+            return cache_key, dict(audio)
+
+    def _queue_end_of_speech_reply(
+        self, recording: dict[str, Any], config: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if (
+            not config.get("end_of_speech_reply_enabled", True)
+            or not config.get("tts_enabled", True)
+            or self._playback_sender is None
+        ):
+            return None
+        try:
+            reply_id, audio = self._ensure_end_of_speech_reply_audio(config)
+            command = self._playback_sender(
+                str(recording["device_id"]),
+                {
+                    "type": "play_audio",
+                    "turn_id": reply_id,
+                    "audio_path": f"/api/tts/{reply_id}/chunk/0/pcm",
+                    "sample_rate": audio["sample_rate"],
+                    "sample_count": audio["sample_count"],
+                    "chunk_index": 0,
+                    "chunk_count": 1,
+                    "is_final_chunk": True,
+                    # Keep the fixed acknowledgement as a short, buffered
+                    # command.  A streamed acknowledgement could overlap the
+                    # first LLM stream before its completion event is tracked,
+                    # and the ESP32 owns only one active stream queue.
+                    "stream_audio": False,
+                    "purpose": "end_of_speech_reply",
+                    "idempotency_key": f"end_of_speech_reply:{recording['id']}",
+                },
+            )
+            self.log(
+                "INFO",
+                "tts",
+                "检测到说话结束，已排队固定提示音",
+                {
+                    "recording_id": recording.get("id", ""),
+                    "reply_text": _prepare_tts_text(
+                        str(config.get("end_of_speech_reply_text", ""))
+                    ),
+                    "duration_ms": audio["duration_ms"],
+                    "command_id": command.get("id", ""),
+                },
+                device_id=str(recording.get("device_id", "")),
+                command_id=str(command.get("id", "")),
+            )
+            return command
+        except Exception as error:
+            # The acknowledgement is helpful but must never prevent the real
+            # ASR/LLM pipeline from processing the recording.
+            self.log(
+                "WARNING",
+                "tts",
+                "固定结束提示音生成或排队失败，继续处理原始语音",
+                {"recording_id": recording.get("id", ""), "error": str(error)[:500]},
+                device_id=str(recording.get("device_id", "")),
+            )
+            return None
 
     def register_existing_recording(
         self, recording: dict[str, Any], reset: bool = True
@@ -1255,19 +1718,52 @@ class ConversationService:
         for turn in self.database.waiting_turns():
             self.enqueue(turn["id"])
 
-    def enqueue(self, turn_id: str) -> None:
+    def enqueue(self, turn_id: str) -> bool:
         with self._queued_lock:
             if turn_id in self._queued:
-                return
+                return True
             self._queued.add(turn_id)
-        self._jobs.put(turn_id)
+        try:
+            self._jobs.put_nowait(turn_id)
+            return True
+        except queue.Full:
+            with self._queued_lock:
+                self._queued.discard(turn_id)
+            self.log(
+                "ERROR",
+                "pipeline",
+                "pending turn queue is full",
+                {"queue_capacity": self.MAX_PENDING_TURNS},
+                turn_id,
+            )
+            try:
+                failed = self.database.update_turn(
+                    turn_id,
+                    status="failed",
+                    error_message="gateway pending turn queue is full",
+                )
+                self.publish("turn_updated", failed)
+            except Exception:
+                pass
+            return False
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.is_set():
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                self._worker_heartbeat = time.monotonic()
+            self._heartbeat_stop.wait(1)
 
     def _worker_loop(self) -> None:
         while True:
+            self._worker_heartbeat = time.monotonic()
             turn_id = self._jobs.get()
             if turn_id is None:
                 return
+            with self._active_turns_lock:
+                self._active_turns.add(turn_id)
             try:
+                self._worker_heartbeat = time.monotonic()
                 self._process_turn(turn_id)
             except Exception as error:  # Worker must survive provider/runtime failures.
                 self.log(
@@ -1285,6 +1781,9 @@ class ConversationService:
                 except Exception:
                     pass
             finally:
+                with self._active_turns_lock:
+                    self._active_turns.discard(turn_id)
+                self._worker_heartbeat = time.monotonic()
                 with self._queued_lock:
                     self._queued.discard(turn_id)
                 self._jobs.task_done()
@@ -1294,6 +1793,57 @@ class ConversationService:
         if path.parent != self.recordings_dir.resolve() or not path.is_file():
             raise FileNotFoundError(f"recording not found: {recording_id}")
         return path
+
+    def _retry_policy(self, config: dict[str, Any]) -> RetryPolicy:
+        return RetryPolicy(
+            max_attempts=max(1, min(3, int(config.get("retry_max_attempts", 2)))),
+            base_delay_seconds=max(0, int(config.get("retry_base_delay_ms", 250))) / 1000,
+            max_delay_seconds=max(0, int(config.get("retry_max_delay_ms", 2000))) / 1000,
+        )
+
+    def _run_stage_with_retry(
+        self,
+        stage: str,
+        operation: Callable[[], Any],
+        config: dict[str, Any],
+        *,
+        turn_id: str | None = None,
+        allow_retry: bool = True,
+        retryable: Callable[[Exception], bool] | None = None,
+        cleanup_path: Path | None = None,
+    ) -> Any:
+        policy = self._retry_policy(config)
+        if not allow_retry:
+            policy = RetryPolicy(max_attempts=1)
+        attempt = 0
+
+        def invoke() -> Any:
+            nonlocal attempt
+            attempt += 1
+            if cleanup_path is not None:
+                cleanup_path.unlink(missing_ok=True)
+            return operation()
+
+        def on_retry(error: Exception, next_attempt: int, delay: float) -> None:
+            self.log(
+                "WARN",
+                stage,
+                "transient failure; retry scheduled",
+                {
+                    "error": str(error)[:500],
+                    "next_attempt": next_attempt,
+                    "delay_ms": round(delay * 1000),
+                },
+                turn_id,
+                attempt=attempt,
+            )
+
+        return run_with_retry(
+            invoke,
+            policy,
+            retryable=retryable or is_transient_error,
+            on_retry=on_retry,
+        )
 
     @staticmethod
     def _elapsed_ms(started_at: str, finished_at: str | None = None) -> int:
@@ -1592,8 +2142,13 @@ class ConversationService:
             )
             started = time.perf_counter()
             try:
-                transcript = self._run_transcriber(
-                    self._recording_path(turn["recording_id"]), config
+                transcript = self._run_stage_with_retry(
+                    "asr",
+                    lambda: self._run_transcriber(
+                        self._recording_path(turn["recording_id"]), config
+                    ),
+                    config,
+                    turn_id=turn_id,
                 ).strip()
                 if not transcript:
                     raise RuntimeError("未识别到有效语音文字")
@@ -1718,12 +2273,15 @@ class ConversationService:
         started = time.perf_counter()
         tts_coordinator: _TTSStreamingCoordinator | None = None
         streamed_voice_chunks: list[str] = []
+        llm_delta_seen = False
         if config["tts_enabled"] and config.get("tts_sentence_streaming_enabled", True):
             tts_coordinator = _TTSStreamingCoordinator(
                 self, turn, turn_id, config, pipeline_started
             )
 
         def on_llm_delta(piece: str) -> None:
+            nonlocal llm_delta_seen
+            llm_delta_seen = True
             if tts_coordinator is None:
                 return
             buffered = getattr(on_llm_delta, "buffer", "") + piece
@@ -1740,10 +2298,19 @@ class ConversationService:
                 if tts_coordinator.submit(chunk):
                     streamed_voice_chunks.append(chunk)
         try:
-            response, usage = self._run_llm(
-                messages,
+            response, usage = self._run_stage_with_retry(
+                "llm",
+                lambda: self._run_llm(
+                    messages,
+                    config,
+                    on_delta=on_llm_delta if tts_coordinator is not None else None,
+                ),
                 config,
-                on_delta=on_llm_delta if tts_coordinator is not None else None,
+                turn_id=turn_id,
+                # A streaming request may retry only before the provider emits
+                # its first delta.  Retrying after a delta would duplicate
+                # text/audio already handed to the TTS coordinator.
+                retryable=lambda error: (not llm_delta_seen) and is_transient_error(error),
             )
             if not response.strip():
                 raise RuntimeError(f"{llm_label}返回了空回复")
@@ -1857,7 +2424,13 @@ class ConversationService:
             config.get("voice_reply_max_chars", 160),
         )
         try:
-            audio = self._run_tts(voice_text, pcm_path, config)
+            audio = self._run_stage_with_retry(
+                "tts",
+                lambda: self._run_tts(voice_text, pcm_path, config),
+                config,
+                turn_id=turn_id,
+                cleanup_path=pcm_path,
+            )
         except Exception as error:
             tts_elapsed = round((time.perf_counter() - started) * 1000)
             failed = self.database.update_turn(

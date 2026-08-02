@@ -11,6 +11,7 @@ import json
 import mimetypes
 import queue
 import re
+import shutil
 import socket
 import struct
 import threading
@@ -23,10 +24,11 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlparse, parse_qs
 
 from .ai_services import ConversationService, LLMCaller, Transcriber, TTSCaller
+from .maintenance import cleanup_tree
 
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +38,7 @@ MAX_RECORDING_BYTES = 8 * 1024 * 1024
 MAX_JSON_BYTES = 64 * 1024
 MAX_EVENTS = 200
 MAX_COMMANDS_PER_DEVICE = 20
+MAX_IDEMPOTENCY_KEY_LENGTH = 160
 DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 COMMAND_TYPES = {
     "ping",
@@ -46,6 +49,10 @@ COMMAND_TYPES = {
     "end_conversation",
 }
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+STREAM_PCM_CHUNK_BYTES = 2048
+STREAM_PCM_PREFILL_BYTES = 32 * 1024
+STREAM_PCM_PACE_FACTOR = 1.15
+STREAM_PCM_END_GUARD_SECONDS = 0.4
 
 
 @dataclass
@@ -57,6 +64,69 @@ class _CommandWebSocketSession:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def stream_pcm_file(
+    path: Path,
+    write_frame: Callable[[int, bytes], None],
+    stop: threading.Event,
+    *,
+    sample_rate: int,
+    chunk_bytes: int = STREAM_PCM_CHUNK_BYTES,
+    prefill_bytes: int = STREAM_PCM_PREFILL_BYTES,
+    pace_factor: float = STREAM_PCM_PACE_FACTOR,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Send PCM at a device-consumable rate after a short startup prefill.
+
+    The ESP32 keeps only a small bounded queue for streaming playback. Sending
+    an entire long file as quickly as TCP accepts it fills that queue and
+    causes the device command socket to be reset before playback completes.
+    A short prefill absorbs normal Wi-Fi jitter; afterward the sender follows
+    the PCM playback clock with a small safety margin.
+    """
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+    if prefill_bytes < 0:
+        raise ValueError("prefill_bytes cannot be negative")
+    if pace_factor <= 0:
+        raise ValueError("pace_factor must be positive")
+
+    started = monotonic_fn()
+    next_deadline: float | None = None
+    bytes_sent = 0
+    chunks_sent = 0
+    completed = False
+    with path.open("rb") as audio_file:
+        while not stop.is_set():
+            chunk = audio_file.read(chunk_bytes)
+            if not chunk:
+                completed = True
+                break
+            write_frame(0x2, chunk)
+            bytes_sent += len(chunk)
+            chunks_sent += 1
+
+            if bytes_sent <= prefill_bytes:
+                continue
+            if next_deadline is None:
+                next_deadline = monotonic_fn()
+            next_deadline += (len(chunk) / (sample_rate * 2)) * pace_factor
+            delay = next_deadline - monotonic_fn()
+            if delay > 0:
+                sleep_fn(delay)
+
+    return {
+        "bytes_sent": bytes_sent,
+        "chunks_sent": chunks_sent,
+        "completed": completed,
+        "elapsed_ms": round((monotonic_fn() - started) * 1000),
+        "prefill_bytes": prefill_bytes,
+        "pace_factor": pace_factor,
+    }
 
 
 class GatewayStore:
@@ -72,6 +142,7 @@ class GatewayStore:
             lambda: deque(maxlen=MAX_COMMANDS_PER_DEVICE)
         )
         self._command_websocket_sessions: dict[str, _CommandWebSocketSession] = {}
+        self._recording_websocket_devices: set[str] = set()
         self._recording_callback = None
         self._load_recordings()
 
@@ -92,7 +163,15 @@ class GatewayStore:
         self._recordings = loaded
 
     def _touch_device_locked(self, device_id: str) -> None:
-        device = self._devices.setdefault(device_id, {"id": device_id})
+        device = self._devices.setdefault(
+            device_id,
+            {
+                "id": device_id,
+                "command_websocket_connected": False,
+                "recording_websocket_connected": False,
+                "reconnect_count": 0,
+            },
+        )
         device["last_seen"] = utc_now()
 
     def touch_device(self, device_id: str) -> None:
@@ -103,6 +182,47 @@ class GatewayStore:
         with self._condition:
             devices = [dict(device) for device in self._devices.values()]
         return sorted(devices, key=lambda item: item["last_seen"], reverse=True)
+
+    def device_health(self, stale_after_seconds: int = 30) -> list[dict[str, Any]]:
+        now = time.time()
+        result = []
+        for device in self.devices():
+            try:
+                age = max(
+                    0.0,
+                    now - datetime.fromisoformat(str(device["last_seen"])).timestamp(),
+                )
+            except (KeyError, TypeError, ValueError, OSError):
+                age = float("inf")
+            item = dict(device)
+            item["last_seen_age_seconds"] = round(age, 3)
+            item["stale"] = age > max(1, stale_after_seconds)
+            item["status"] = "stale" if item["stale"] else "online"
+            result.append(item)
+        return result
+
+    def mark_recording_websocket(self, device_id: str, connected: bool) -> None:
+        with self._condition:
+            self._touch_device_locked(device_id)
+            if connected:
+                self._recording_websocket_devices.add(device_id)
+            else:
+                self._recording_websocket_devices.discard(device_id)
+            device = self._devices[device_id]
+            device["recording_websocket_connected"] = connected
+            device[
+                "last_recording_websocket_" + ("connected_at" if connected else "disconnected_at")
+            ] = utc_now()
+
+    def _mark_command_websocket_locked(self, device_id: str, connected: bool) -> None:
+        self._touch_device_locked(device_id)
+        device = self._devices[device_id]
+        if connected:
+            device["reconnect_count"] = int(device.get("reconnect_count", 0)) + 1
+        device["command_websocket_connected"] = connected
+        device[
+            "last_command_websocket_" + ("connected_at" if connected else "disconnected_at")
+        ] = utc_now()
 
     def save_recording(
         self,
@@ -174,6 +294,58 @@ class GatewayStore:
                 print(f"AI queue callback failed: {error}")
         return dict(metadata)
 
+    def cleanup_recordings(
+        self,
+        *,
+        max_age_seconds: float,
+        protected_ids: set[str] | None = None,
+        max_total_bytes: int = 0,
+    ) -> dict[str, int]:
+        """Remove expired recording WAV/metadata pairs under the store lock."""
+
+        protected = protected_ids or set()
+        now = time.time()
+        with self._condition:
+            records = list(self._recordings)
+        records.sort(key=lambda item: str(item.get("created_at", "")))
+        sizes = sum(int(item.get("size_bytes", 0)) for item in records)
+        deleted = 0
+        deleted_bytes = 0
+        candidates: list[tuple[dict[str, Any], bool]] = []
+        for metadata in records:
+            try:
+                created = datetime.fromisoformat(str(metadata["created_at"])).timestamp()
+            except (KeyError, TypeError, ValueError, OSError):
+                created = now
+            if metadata.get("id") in protected:
+                continue
+            expired = now - created >= max_age_seconds
+            if expired or (max_total_bytes > 0 and sizes > max_total_bytes):
+                candidates.append((metadata, expired))
+        for metadata, expired in candidates:
+            if not expired and max_total_bytes > 0 and sizes <= max_total_bytes:
+                break
+            recording_id = str(metadata.get("id", ""))
+            filename = str(metadata.get("filename", ""))
+            wav_path = (self.recordings_dir / filename).resolve()
+            metadata_path = (self.recordings_dir / f"{recording_id}.json").resolve()
+            if wav_path.parent != self.recordings_dir or metadata_path.parent != self.recordings_dir:
+                continue
+            size = int(metadata.get("size_bytes", 0))
+            try:
+                wav_path.unlink(missing_ok=True)
+                metadata_path.unlink(missing_ok=True)
+            except OSError:
+                continue
+            sizes = max(0, sizes - size)
+            deleted += 1
+            deleted_bytes += size
+            with self._condition:
+                self._recordings = [
+                    item for item in self._recordings if item.get("id") != recording_id
+                ]
+        return {"deleted_files": deleted * 2, "deleted_bytes": deleted_bytes}
+
     def recordings(self) -> list[dict[str, Any]]:
         with self._condition:
             return [dict(item) for item in self._recordings]
@@ -202,13 +374,26 @@ class GatewayStore:
         device_id: str,
         command_type: str,
         payload: dict[str, Any] | None = None,
+        *,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
+        idempotency_key = ""
+        if payload:
+            idempotency_key = str(payload.get("idempotency_key", "")).strip()
+            if not idempotency_key and command_type == "play_audio":
+                turn_id = str(payload.get("turn_id", ""))
+                chunk_index = str(payload.get("chunk_index", "0"))
+                if turn_id:
+                    idempotency_key = f"play_audio:{turn_id}:{chunk_index}"
+        idempotency_key = idempotency_key[:MAX_IDEMPOTENCY_KEY_LENGTH]
         command = {
             "id": uuid.uuid4().hex,
             "device_id": device_id,
             "type": command_type,
             "created_at": utc_now(),
         }
+        if request_id:
+            command["request_id"] = request_id
         if payload:
             command.update(
                 {
@@ -218,6 +403,13 @@ class GatewayStore:
                 }
             )
         with self._condition:
+            if idempotency_key:
+                for queued in self._commands[device_id]:
+                    if queued.get("idempotency_key") == idempotency_key:
+                        return dict(queued)
+                command["idempotency_key"] = idempotency_key
+            if len(self._commands[device_id]) >= MAX_COMMANDS_PER_DEVICE:
+                raise OverflowError(f"device command queue is full: {device_id}")
             self._commands[device_id].append(command)
             self._condition.notify_all()
         return dict(command)
@@ -249,7 +441,7 @@ class GatewayStore:
                 stop=stop,
                 connection=connection,
             )
-            self._touch_device_locked(device_id)
+            self._mark_command_websocket_locked(device_id, True)
             self._condition.notify_all()
         if previous is not None:
             # A reconnect can arrive before the old request handler has unwound.
@@ -268,6 +460,7 @@ class GatewayStore:
             session = self._command_websocket_sessions.get(device_id)
             if session is not None and (token is None or session.token == token):
                 self._command_websocket_sessions.pop(device_id, None)
+                self._mark_command_websocket_locked(device_id, False)
             self._condition.notify_all()
 
     def command_websocket_connected(self, device_id: str) -> bool:
@@ -278,7 +471,13 @@ class GatewayStore:
         with self._condition:
             return sorted(self._command_websocket_sessions)
 
-    def add_event(self, device_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def add_event(
+        self,
+        device_id: str,
+        payload: dict[str, Any],
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         event = {
             "id": uuid.uuid4().hex,
             "device_id": device_id,
@@ -287,6 +486,8 @@ class GatewayStore:
             "created_at": utc_now(),
             "details": payload.get("details", {}),
         }
+        if request_id:
+            event["request_id"] = request_id
         with self._condition:
             self._touch_device_locked(device_id)
             self._events.appendleft(event)
@@ -314,8 +515,116 @@ class GatewayHTTPServer(ThreadingHTTPServer):
         self.device_token = device_token
         self.web_root = web_root.resolve()
         self.ai_service = ai_service
+        self._maintenance_stop = threading.Event()
+        self._maintenance_thread = threading.Thread(
+            target=self._maintenance_loop,
+            name="gateway-maintenance",
+            daemon=True,
+        )
+        self._maintenance_thread.start()
+        self._closed = False
+
+    def _maintenance_loop(self) -> None:
+        # Run once shortly after startup, then keep the cleanup cadence bounded
+        # so a large artifact directory cannot block request handling.
+        self._maintenance_stop.wait(1)
+        while not self._maintenance_stop.is_set():
+            try:
+                config = self.ai_service.database.config(include_secret=True)
+                recovered_turns = self.ai_service.recover_stale_turns()
+                protected = self.ai_service.active_recording_ids()
+                recording_result = self.store.cleanup_recordings(
+                    max_age_seconds=max(
+                        3600,
+                        int(config.get("recording_retention_hours", 168)) * 3600,
+                    ),
+                    protected_ids=protected,
+                    max_total_bytes=max(0, int(config.get("storage_max_bytes", 0))),
+                )
+                temp_result = cleanup_tree(
+                    self.store.recordings_dir,
+                    max_age_seconds=max(
+                        300,
+                        int(config.get("temporary_retention_minutes", 60)) * 60,
+                    ),
+                    protected_names=set(),
+                    allowed_suffixes={".tmp"},
+                )
+                artifact_result = self.ai_service.cleanup_artifacts(
+                    config=config,
+                    protected_turn_ids=self.ai_service.active_turn_ids(),
+                )
+                deleted = (
+                    recording_result["deleted_files"]
+                    + temp_result["deleted_files"]
+                    + artifact_result["deleted_files"]
+                )
+                if deleted:
+                    self.ai_service.log(
+                        "INFO",
+                        "maintenance",
+                        "artifact cleanup completed",
+                        {
+                            "recordings": recording_result,
+                            "temporary": temp_result,
+                            "tts": artifact_result,
+                        },
+                    )
+                if recovered_turns:
+                    self.ai_service.log(
+                        "WARN",
+                        "maintenance",
+                        "stale conversation turns recovered",
+                        {"count": recovered_turns},
+                    )
+            except Exception as error:
+                self.ai_service.log(
+                    "ERROR",
+                    "maintenance",
+                    "artifact cleanup failed",
+                    {"error": str(error)[:500]},
+                )
+            self._maintenance_stop.wait(300)
+
+    def health_snapshot(self) -> dict[str, Any]:
+        disk = shutil.disk_usage(self.store.data_dir)
+        snapshot = self.ai_service.health_snapshot()
+        config = self.ai_service.database.config(include_secret=True)
+        devices = self.store.device_health(
+            int(config.get("health_stale_device_seconds", 30))
+        )
+        minimum_free_bytes = 64 * 1024 * 1024
+        # ``storage_max_bytes`` is an artifact quota, not a whole-volume
+        # quota.  Readiness only needs a safe free-space floor here; the
+        # maintenance worker enforces the artifact quota separately.
+        disk_ok = disk.free >= minimum_free_bytes
+        snapshot["checks"]["disk"] = disk_ok
+        snapshot["ready"] = bool(snapshot.get("ready") and disk_ok)
+        snapshot["ok"] = snapshot["ready"]
+        snapshot.update(
+            {
+                "time": utc_now(),
+                "disk": {
+                    "total_bytes": disk.total,
+                    "used_bytes": disk.used,
+                    "free_bytes": disk.free,
+                    "used_percent": round((disk.used / disk.total) * 100, 2)
+                    if disk.total
+                    else 0,
+                },
+                "device_count": len(devices),
+                "devices": devices,
+                "command_websocket_devices": self.store.command_websocket_devices(),
+            }
+        )
+        return snapshot
 
     def server_close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._maintenance_stop.set()
+        self._maintenance_thread.join(timeout=2)
         self.ai_service.close()
         super().server_close()
 
@@ -323,6 +632,10 @@ class GatewayHTTPServer(ThreadingHTTPServer):
 class GatewayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server: GatewayHTTPServer
+
+    def setup(self) -> None:
+        super().setup()
+        self.request_id = uuid.uuid4().hex
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
@@ -334,6 +647,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", self.request_id)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -666,7 +980,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
         self.close_connection = True
-        self.server.store.touch_device(device_id)
+        self.server.store.mark_recording_websocket(device_id, True)
         print(f"WebSocket recording client connected: {device_id}")
         self.server.ai_service.log(
             "INFO", "websocket", "ESP32 录音 WebSocket 已连接", {"device_id": device_id}
@@ -753,6 +1067,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._write_websocket_frame(0x8, struct.pack("!H", 1008))
             except OSError:
                 pass
+        finally:
+            self.server.store.mark_recording_websocket(device_id, False)
 
     def _handle_command_websocket(self, device_id: str) -> None:
         """Keep one bidirectional command channel open for low-latency control/audio."""
@@ -817,24 +1133,45 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         time.sleep(0.02)
                         turn_id = str(command["turn_id"])
                         chunk_index = int(command["chunk_index"])
+                        sample_rate = int(command.get("sample_rate", 16000))
                         audio_path = self.server.ai_service.tts_path(turn_id, chunk_index)
                         if audio_path is None:
                             raise FileNotFoundError("TTS chunk not found")
-                        with audio_path.open("rb") as audio_file:
-                            while not stop.is_set():
-                                chunk = audio_file.read(2048)
-                                if not chunk:
-                                    break
-                                self._write_websocket_frame(0x2, chunk)
-                        send_json(
-                            {
-                                "type": "audio_stream_end",
-                                "command_id": command["id"],
-                                "turn_id": turn_id,
-                                "sample_count": command.get("sample_count", 0),
-                                "is_final_chunk": bool(command.get("is_final_chunk", False)),
-                            }
+                        stream_stats = stream_pcm_file(
+                            audio_path,
+                            self._write_websocket_frame,
+                            stop,
+                            sample_rate=sample_rate,
                         )
+                        self.server.ai_service.log(
+                            "INFO",
+                            "websocket",
+                            "command WebSocket PCM stream sent",
+                            {
+                                "device_id": device_id,
+                                "command_id": command.get("id", ""),
+                                "turn_id": turn_id,
+                                "sample_rate": sample_rate,
+                                **stream_stats,
+                            },
+                        )
+                        if not stop.is_set() and stream_stats["completed"]:
+                            # Give the ESP32 WebSocket task one scheduling slice
+                            # after the final binary frame.  On long streams the
+                            # receiver may still be copying the last PCM block
+                            # into its bounded playback queue; sending the text
+                            # terminator immediately can otherwise starve that
+                            # callback and trigger the device socket timeout.
+                            time.sleep(STREAM_PCM_END_GUARD_SECONDS)
+                            send_json(
+                                {
+                                    "type": "audio_stream_end",
+                                    "command_id": command["id"],
+                                    "turn_id": turn_id,
+                                    "sample_count": command.get("sample_count", 0),
+                                    "is_final_chunk": bool(command.get("is_final_chunk", False)),
+                                }
+                            )
                     except (KeyError, TypeError, ValueError, OSError) as error:
                         send_json(
                             {
@@ -888,7 +1225,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "type": event_payload.get("event_type", event_payload.get("type", "event")),
                         "details": event_payload.get("details", {}),
                     }
-                event = self.server.store.add_event(device_id, normalized)
+                event = self.server.store.add_event(
+                    device_id, normalized, request_id=self.request_id
+                )
                 self.server.ai_service.device_event(event)
         except (ConnectionError, BrokenPipeError, ConnectionResetError, OSError) as error:
             self.server.ai_service.log(
@@ -921,28 +1260,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path == "/health":
-            config = self.server.ai_service.public_config()
+        if path == "/health/live":
+            self._send_json(HTTPStatus.OK, {"ok": True, "time": utc_now()})
+            return
+        if path == "/health/ready":
+            snapshot = self.server.health_snapshot()
+            status = HTTPStatus.OK if snapshot.get("ready") else HTTPStatus.SERVICE_UNAVAILABLE
+            self._send_json(status, snapshot)
+            return
+        if path == "/health/devices":
+            config = self.server.ai_service.database.config(include_secret=True)
             self._send_json(
                 HTTPStatus.OK,
                 {
-                    "ok": True,
                     "time": utc_now(),
-                    "ai_worker_running": config["worker_running"],
-                    "sensevoice_loaded": config["sensevoice_loaded"],
+                    "devices": self.server.store.device_health(
+                        int(config.get("health_stale_device_seconds", 30))
+                    ),
                     "command_websocket_devices": self.server.store.command_websocket_devices(),
-                    "asr_provider": config["asr_provider"],
-                    "streaming_asr": self.server.ai_service.streaming_asr_supported(),
-                    "llm_provider": config["llm_provider"],
-                    "tts_provider": config["tts_provider"],
-                    "asr_api_key_configured": config["asr_api_key_configured"],
-                    "llm_api_key_configured": config["llm_api_key_configured"],
-                    "tts_api_key_configured": config["tts_api_key_configured"],
-                    "unisound_api_key_configured": config[
-                        "unisound_api_key_configured"
-                    ],
                 },
             )
+            return
+        if path == "/health":
+            snapshot = self.server.health_snapshot()
+            config = self.server.ai_service.public_config()
+            legacy_payload = {**snapshot, **config}
+            # Preserve the historical /health contract (process reachable),
+            # while /health/ready carries the stricter dependency verdict.
+            legacy_payload["ok"] = True
+            self._send_json(HTTPStatus.OK, legacy_payload)
             return
         if path == "/api/capabilities":
             self._send_json(
@@ -1217,9 +1563,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     )
                     return
                 command_payload = {"turn_id": turn_id}
-            command = self.server.store.enqueue_command(
-                device_id, command_type, command_payload
-            )
+            try:
+                command = self.server.store.enqueue_command(
+                    device_id,
+                    command_type,
+                    command_payload,
+                    request_id=self.request_id,
+                )
+            except OverflowError as error:
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"error": str(error), "retryable": True},
+                )
+                return
             self._send_json(HTTPStatus.ACCEPTED, command)
             return
 
@@ -1234,7 +1590,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if payload is None:
                 return
-            event = self.server.store.add_event(device_id, payload)
+            event = self.server.store.add_event(
+                device_id, payload, request_id=self.request_id
+            )
             self.server.ai_service.device_event(event)
             self._send_json(HTTPStatus.CREATED, event)
             return

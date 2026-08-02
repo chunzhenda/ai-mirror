@@ -89,7 +89,11 @@ function renderDevices(devices) {
     list.append(option);
 
     const lastSeen = new Date(device.last_seen).getTime();
-    const online = Date.now() - lastSeen < 10_000;
+    const online = Boolean(
+      device.command_websocket_connected ||
+      device.recording_websocket_connected ||
+      Date.now() - lastSeen < 10_000,
+    );
     const item = node("div", "list-item");
     const title = node("div");
     title.append(node("strong", "", device.id));
@@ -98,6 +102,11 @@ function renderDevices(devices) {
       title,
       node("span", `device-state ${online ? "online" : "offline"}`, online ? "在线" : "离线"),
     );
+    const transport = [
+      device.command_websocket_connected ? "命令 WS" : "",
+      device.recording_websocket_connected ? "录音 WS" : "",
+    ].filter(Boolean).join(" · ");
+    if (transport) item.append(node("small", "", transport));
     container.append(item);
   });
 
@@ -261,6 +270,10 @@ function renderLogs() {
       node("strong", "", entry.component),
       node("time", "", formatTime(entry.created_at)),
     );
+    const trace = [entry.turn_id, entry.command_id, entry.request_id]
+      .filter(Boolean)
+      .join(" · ");
+    if (trace) heading.append(node("small", "", trace));
     item.append(heading, node("p", "", entry.message));
     if (entry.details && Object.keys(entry.details).length) {
       item.append(node("code", "", JSON.stringify(entry.details, null, 2)));
@@ -338,6 +351,8 @@ function populateConfig(config) {
   $("#tts-voice").value = config.tts_voice;
   $("#tts-rate").value = config.tts_rate;
   $("#tts-volume").value = config.tts_volume;
+  $("#end-of-speech-reply-enabled").checked = config.end_of_speech_reply_enabled;
+  $("#end-of-speech-reply-text").value = config.end_of_speech_reply_text;
   $("#tts-api-url").value = config.tts_api_url;
   $("#tts-api-model").value = config.tts_api_model;
   $("#tts-api-timeout").value = config.tts_api_timeout_seconds;
@@ -381,7 +396,9 @@ async function refresh() {
       api("/api/logs?limit=200"),
     ]);
     $("#gateway-status").className = "status-pill online";
-    $("#gateway-status").textContent = `网关在线 · ${formatTime(health.time)} · SSE`;
+    const ready = health.ready ? "系统就绪" : "依赖未就绪";
+    const disk = health.disk ? ` · 磁盘 ${health.disk.used_percent}%` : "";
+    $("#gateway-status").textContent = `网关在线 · ${ready}${disk} · SSE`;
     const worker = health.ai_worker_running ? "后台线程运行中" : "后台线程未启动";
     const model = asrProviderLabel(health.asr_provider, health.sensevoice_loaded);
     const llm = llmProviderLabel(health.llm_provider);
@@ -516,6 +533,8 @@ async function saveConfig(event) {
     tts_voice: $("#tts-voice").value.trim(),
     tts_rate: Number($("#tts-rate").value),
     tts_volume: Number($("#tts-volume").value),
+    end_of_speech_reply_enabled: $("#end-of-speech-reply-enabled").checked,
+    end_of_speech_reply_text: $("#end-of-speech-reply-text").value.trim(),
     tts_api_url: $("#tts-api-url").value.trim(),
     tts_api_model: $("#tts-api-model").value.trim(),
     tts_api_timeout_seconds: Number($("#tts-api-timeout").value),

@@ -208,6 +208,9 @@
               </div>
             </div>
             <label class="check-row"><input id="tts-enabled" type="checkbox">生成语音并下发 ESP32 播放</label>
+            <label class="check-row"><input id="end-of-speech-reply-enabled" type="checkbox">网关固定语音（ESP32 本地提示音默认开启）</label>
+            <label for="end-of-speech-reply-text">说话结束提示语</label>
+            <input id="end-of-speech-reply-text" maxlength="200" autocomplete="off" placeholder="好的，我听到了。">
             <label class="check-row"><input id="tts-sentence-streaming-enabled" type="checkbox">启用分句 TTS，首句优先播放</label>
             <label for="tts-sentence-max-chars">单句最大字符数</label>
             <input id="tts-sentence-max-chars" type="number" min="16" max="240">

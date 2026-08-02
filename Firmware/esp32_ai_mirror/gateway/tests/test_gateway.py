@@ -13,7 +13,7 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from gateway.src.app import build_server
+from gateway.src.app import build_server, stream_pcm_file
 from gateway.src.ai_services import (
     _is_end_conversation_command,
     limit_voice_reply,
@@ -276,6 +276,69 @@ class GatewayIntegrationTest(unittest.TestCase):
             self.assertEqual(stream_command["id"], end["command_id"])
         finally:
             connection.close()
+
+    def test_long_pcm_stream_is_paced_after_prefill(self):
+        """A long PCM stream must not burst faster than the ESP32 playback queue."""
+        pcm_path = Path(self.temp_dir.name) / "long.pcm"
+        pcm_path.write_bytes(b"\x00" * (2048 * 4))
+        clock = {"now": 0.0, "sleeps": []}
+
+        def monotonic():
+            return clock["now"]
+
+        def sleep(seconds):
+            clock["sleeps"].append(seconds)
+            clock["now"] += seconds
+
+        sent = []
+        stats = stream_pcm_file(
+            pcm_path,
+            lambda opcode, payload: sent.append((opcode, payload)),
+            threading.Event(),
+            sample_rate=16000,
+            prefill_bytes=2048,
+            pace_factor=1.05,
+            sleep_fn=sleep,
+            monotonic_fn=monotonic,
+        )
+
+        self.assertEqual(4, stats["chunks_sent"])
+        self.assertEqual(8192, stats["bytes_sent"])
+        self.assertEqual(4, len(sent))
+        self.assertEqual(3, len(clock["sleeps"]))
+        self.assertTrue(all(value > 0 for value in clock["sleeps"]))
+        self.assertGreater(clock["now"], 0.18)
+
+    def test_recording_saved_queues_fixed_end_of_speech_reply_before_pipeline(self):
+        service = self.server.ai_service
+        service.update_config({"end_of_speech_reply_enabled": True})
+        commands = []
+        pcm = struct.pack("<160h", *([120] * 160))
+
+        def fake_tts(text, path, _config):
+            self.assertEqual("好的，我听到了。", text)
+            path.write_bytes(pcm)
+            return {"sample_rate": 16000, "sample_count": 160, "duration_ms": 10}
+
+        service._tts_caller = fake_tts
+        service.set_playback_sender(
+            lambda device_id, payload: commands.append(
+                {"device_id": device_id, **payload}
+            )
+            or {"id": "a" * 32, "type": payload["type"]}
+        )
+        recording = self.server.store.save_recording(
+            DEVICE_ID, pcm, 16000, 1, 16, session_id=DEVICE_ID
+        )
+
+        self.assertEqual(1, len(commands))
+        self.assertEqual("play_audio", commands[0]["type"])
+        self.assertEqual("end_of_speech_reply", commands[0]["purpose"])
+        self.assertEqual("好的，我听到了。", service.database.config(True)["end_of_speech_reply_text"])
+        self.assertEqual(160, commands[0]["sample_count"])
+        self.assertTrue(
+            (service.tts_dir / f"{commands[0]['turn_id']}-chunk-0.pcm").is_file()
+        )
 
     def test_health_and_web_console(self):
         status, _, payload = self.json_request("GET", "/health")
@@ -853,7 +916,11 @@ class GatewayIntegrationTest(unittest.TestCase):
         status, _, _ = self.json_request(
             "POST",
             "/api/config",
-            {"unisound_api_key": "fake-key", "tts_sentence_max_chars": 16},
+            {
+                "unisound_api_key": "fake-key",
+                "tts_sentence_max_chars": 16,
+                "end_of_speech_reply_enabled": False,
+            },
         )
         self.assertEqual(200, status)
         pcm = struct.pack("<160h", *([120] * 160))
@@ -866,7 +933,10 @@ class GatewayIntegrationTest(unittest.TestCase):
             if turn and turn["status"] == "playback_queued" and len(tts_chunks) >= 2:
                 break
             time.sleep(0.03)
-        self.assertEqual(["第一句。", "第二句！"], tts_chunks)
+        # TTS synthesis is intentionally concurrent; playback order is
+        # asserted below through chunk/command sequencing, not synthesis
+        # worker completion order.
+        self.assertCountEqual(["第一句。", "第二句！"], tts_chunks)
         self.assertIsNotNone(turn)
         first = self.server.store.take_command(DEVICE_ID, 0)
         self.assertIsNotNone(first)
@@ -992,7 +1062,11 @@ class GatewayIntegrationTest(unittest.TestCase):
         status, _, _ = self.json_request(
             "POST",
             "/api/config",
-            {"llm_provider": "deepseek", "llm_api_key": "fake-key"},
+            {
+                "llm_provider": "deepseek",
+                "llm_api_key": "fake-key",
+                "end_of_speech_reply_enabled": False,
+            },
         )
         self.assertEqual(200, status)
 

@@ -8,6 +8,7 @@
  */
 
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <string.h>
 #include "sdkconfig.h"
@@ -44,6 +45,8 @@
 #include "board_buttons.h"
 #include "board_rgb.h"
 #include "board_wifi_prov.h"
+#include "ai_mirror_gateway.h"
+#include "ai_mirror_audio_playback.h"
 
 /* Forward declaration */
 extern void ai_mirror_ui_show_face_demo(lv_disp_t *disp);
@@ -242,6 +245,16 @@ static void i2s_music(void *args)
 #define AEC_FRAME_BYTES         (AEC_STEREO_SAMPLES * sizeof(int16_t))
 #define AEC_REC_MAX_SECONDS     20
 #define AEC_REC_BUF_SAMPLES     (AI_MIRROR_SAMPLE_RATE * AEC_REC_MAX_SECONDS)
+#define AEC_SESSION_TIMEOUT_MS  30000
+#define AEC_REPLY_TIMEOUT_MS    120000
+#define AEC_SESSION_GUARD_MS    800
+#define AEC_SESSION_PREROLL_MS  400
+#define AEC_SESSION_PREROLL_SAMPLES \
+    (AI_MIRROR_SAMPLE_RATE * AEC_SESSION_PREROLL_MS / 1000)
+#define AEC_SESSION_VAD_RUN_FRAMES  3
+#define AEC_SESSION_MIN_LEVEL       60
+#define AEC_SESSION_NOISE_MULTIPLIER 1
+#define AEC_SESSION_MAX_DYNAMIC_LEVEL 300
 #define AEC_VAD_SILENCE_END_MS  1000    /* ms: trailing silence after speech -> "user stopped talking" */
 #define AEC_VAD_TAIL_DROP_MS    900   /* ms of tail silence to drop before decode (< VAD 1s threshold) */
 #define AEC_VAD_TAIL_DROP_FRAMES  (AEC_VAD_TAIL_DROP_MS / VAD_FRAME_MS)  /* 45 opus frames (~0.9s) */
@@ -270,6 +283,9 @@ static void i2s_music(void *args)
 #define OPUS_FRAME_SAMPLES     (AI_MIRROR_SAMPLE_RATE * VAD_FRAME_MS / 1000)      /* 320 @16kHz */
 #define OPUS_OUT_BYTES         400
 #define AEC_OPUS_MAX_FRAMES    (AEC_REC_BUF_SAMPLES / OPUS_FRAME_SAMPLES)          /* max opus frames in an 8s recording (400) */
+/* sdkconfig uses a 100 Hz FreeRTOS tick, so pdMS_TO_TICKS(1) rounds to zero
+ * and only yields without letting IDLE1 run. Use a real one-tick delay. */
+#define OPUS_TASK_YIELD_MS     10
 
 /* Smart-assistant style chime motifs. A bell-like timbre (fundamental + two
  * phase-locked harmonics behind a percussive decay envelope) and a rising /
@@ -280,16 +296,66 @@ typedef struct {
     uint32_t duration_ms;
 } aec_chime_note_t;
 
+typedef enum {
+    AUDIO_STATE_IDLE = 0,
+    AUDIO_STATE_RECORDING = 1,
+    AUDIO_STATE_WAIT_ENCODING = 2,
+    AUDIO_STATE_WAIT_REPLY = 3,
+    AUDIO_STATE_PLAYBACK = 4,
+    AUDIO_STATE_SESSION_LISTEN = 5,
+} ai_mirror_audio_state_t;
+
+typedef struct {
+    int16_t *samples;
+    size_t capacity;
+    size_t count;
+    size_t write_index;
+} ai_mirror_preroll_t;
+
+static void aec_preroll_reset(ai_mirror_preroll_t *preroll)
+{
+    preroll->count = 0;
+    preroll->write_index = 0;
+}
+
+static void aec_preroll_push(ai_mirror_preroll_t *preroll,
+                             const int16_t *samples,
+                             size_t sample_count)
+{
+    for (size_t i = 0; i < sample_count; i++) {
+        preroll->samples[preroll->write_index] = samples[i];
+        preroll->write_index = (preroll->write_index + 1) % preroll->capacity;
+        if (preroll->count < preroll->capacity) {
+            preroll->count++;
+        }
+    }
+}
+
+static size_t aec_preroll_copy(const ai_mirror_preroll_t *preroll,
+                               int16_t *output,
+                               size_t output_capacity)
+{
+    size_t count = preroll->count < output_capacity
+                       ? preroll->count
+                       : output_capacity;
+    size_t start = (preroll->write_index + preroll->capacity - count) %
+                   preroll->capacity;
+    for (size_t i = 0; i < count; i++) {
+        output[i] = preroll->samples[(start + i) % preroll->capacity];
+    }
+    return count;
+}
+
 /* press: E5 -> B5, rising fifth = "I'm listening" */
 static const aec_chime_note_t s_chime_start[] = {
     { 659.25f, 90 },
     { 987.77f, 170 },
 };
 
-/* release: B5 -> E5, falling fifth = "got it, done" */
-static const aec_chime_note_t s_chime_stop[] = {
+/* release: B5 -> E5, falling fifth = "conversation ended" */
+static const aec_chime_note_t s_chime_end[] = {
     { 987.77f, 90 },
-    { 659.25f, 190 },
+    { 659.25f, 170 },
 };
 
 static inline uint32_t aec_mean_abs(const int16_t *data, int n)
@@ -393,6 +459,27 @@ static void aec_rec_start_feedback(i2s_chan_handle_t tx, i2s_chan_handle_t rx,
     ESP_LOGI(TAG, "[aec] discarded %d frames (%d ms) after chime", discard_frames, discard_frames * AEC_FRAME_MS);
 }
 
+/* Long-conversation end feedback. Drain the I2S/acoustic tail before returning
+ * to WakeNet so the device's own chime cannot immediately trigger a new session. */
+static void aec_session_end_feedback(i2s_chan_handle_t tx,
+                                     i2s_chan_handle_t rx,
+                                     int16_t *chime_buf)
+{
+    play_chime(tx, rx, chime_buf, s_chime_end,
+               sizeof(s_chime_end) / sizeof(s_chime_end[0]));
+
+    const int discard_frames =
+        (AEC_BEEP_DISCARD_MS + AEC_FRAME_MS - 1) / AEC_FRAME_MS;
+    for (int d = 0; d < discard_frames; d++) {
+        size_t bw = 0;
+        memset(chime_buf, 0, AEC_FRAME_BYTES);
+        i2s_channel_write(tx, chime_buf, AEC_FRAME_BYTES, &bw, 1000);
+        size_t br = 0;
+        i2s_channel_read(rx, chime_buf, AEC_FRAME_BYTES, &br, 1000);
+    }
+    ESP_LOGI(TAG, "[session] end chime done");
+}
+
 /* OPUS encode context shared between the recording task and the async
  * opus_enc_task. The recorder pushes opus-frame sample offsets into a queue
  * while recording; opus_enc_task drains it, encodes, and signals done. */
@@ -418,12 +505,15 @@ typedef struct {
 static opus_enc_ctx_t s_enc;
 
 /* Async opus encoder task: lower priority than the recorder (prio 5) so it
- * never starves capture. Pinned to CPU0 so rec_buf (written by the recorder
- * on CPU0) is read on the same core -- no cross-core PSRAM cache issues. */
+ * never starves capture. It is pinned to CPU1; the recorder/AEC task also
+ * runs there, so the encoder must explicitly yield while draining a full
+ * queue. Without a yield, IDLE1 can be starved long enough to trip the task
+ * watchdog even though the encode itself is making progress. */
 static void opus_enc_task(void *args)
 {
     (void)args;
     int offset;
+    uint32_t frames_since_yield = 0;
     while (1) {
         if (xQueueReceive(s_enc.queue, &offset, portMAX_DELAY) != pdPASS) {
             continue;
@@ -458,7 +548,7 @@ static void opus_enc_task(void *args)
                     }
                     dec_byte_off += s_enc.frame_bytes[i];
                     if ((i % 10) == 0) {
-                        vTaskDelay(pdMS_TO_TICKS(1)); /* yield so the watchdog does not fire */
+                        vTaskDelay(pdMS_TO_TICKS(OPUS_TASK_YIELD_MS));
                     }
                     if ((i % 25) == 0) {
                         ESP_LOGI(TAG, "[aec] enc_task dec f=%u/%u samples=%u",
@@ -483,6 +573,16 @@ static void opus_enc_task(void *args)
                 s_enc.packed_len += enc_bytes;
                 s_enc.total_bytes += enc_bytes;
                 s_enc.frame_cnt++;
+                /* xQueueReceive() returns immediately while the recorder has
+                 * queued data. Yield periodically so CPU1's idle task and
+                 * lower-priority housekeeping can run during long recordings.
+                 * A one-tick delay every four frames adds only a small amount
+                 * of latency while preventing the IDLE1 task watchdog from
+                 * being starved by opus_encode(). */
+                if (++frames_since_yield >= 4) {
+                    frames_since_yield = 0;
+                    vTaskDelay(pdMS_TO_TICKS(OPUS_TASK_YIELD_MS));
+                }
                 if ((s_enc.frame_cnt % 25) == 0) {
                     ESP_LOGI(TAG, "[aec] enc_task f=%u packed=%uB", (unsigned)s_enc.frame_cnt, (unsigned)s_enc.total_bytes);
                 }
@@ -503,9 +603,9 @@ static void i2s_aec_demo(void *args)
     ESP_LOGI(TAG, "[aec] AEC created (mode %d, %dms frame)", aec_mode, AEC_FRAME_MS);
 
     /* Wake word detection (Hi Lexin / wn9_hilexin), loaded from flash "model"
-     * partition via esp_srmodel. Runs only in IDLE to start recording hands-free,
-     * alongside the BTN1 trigger. Graceful degradation: if any step fails the
-     * device falls back to BTN1-only recording (the existing behavior). */
+     * partition via esp_srmodel. Runs in IDLE and SESSION_LISTEN so it can start
+     * or restart a hands-free conversation. Graceful degradation: if any step
+     * fails the device falls back to BTN1-only recording (the existing behavior). */
     const esp_wn_iface_t *wn_iface = NULL;
     model_iface_data_t *wn_model = NULL;
     int wn_chunksize = 0;
@@ -579,11 +679,13 @@ static void i2s_aec_demo(void *args)
     int16_t *chime_buf = heap_caps_malloc(AEC_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     int16_t *vad_buf = heap_caps_malloc(VAD_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM); /* ring buf 2x160 @8kHz */
     int16_t *ds_buf = heap_caps_malloc(AEC_FRAME_SAMPLES / 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM); /* 16k->8k downsample scratch */
+    int16_t *session_preroll_buf = heap_caps_malloc(
+        AEC_SESSION_PREROLL_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     uint8_t *opus_out = heap_caps_malloc(OPUS_OUT_BYTES, MALLOC_CAP_SPIRAM); /* single-frame OPUS encode scratch */
     uint8_t *opus_packed = heap_caps_malloc(AEC_OPUS_MAX_FRAMES * OPUS_OUT_BYTES, MALLOC_CAP_SPIRAM); /* packed OPUS frames for decode */
     int16_t *opus_frame_bytes = heap_caps_malloc(AEC_OPUS_MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM); /* per-frame encoded byte count */
 
-    if (!mic_ster || !ref_ster || !mic_mono || !ref_mono || !out_mono || !play_ster || !rec_buf || !decode_buf || !chime_buf || !vad_buf || !ds_buf || !opus_out || !opus_packed || !opus_frame_bytes) {
+    if (!mic_ster || !ref_ster || !mic_mono || !ref_mono || !out_mono || !play_ster || !rec_buf || !decode_buf || !chime_buf || !vad_buf || !ds_buf || !session_preroll_buf || !opus_out || !opus_packed || !opus_frame_bytes) {
         ESP_LOGE(TAG, "[aec] no PSRAM for buffers, abort task");
         vTaskDelete(NULL);
     }
@@ -604,7 +706,10 @@ static void i2s_aec_demo(void *args)
     s_enc.drop_tail = false;
     s_enc.decode_samples = 0;
     s_enc.decode_peak = 1;
-    s_enc.queue = xQueueCreate(AEC_OPUS_MAX_FRAMES, sizeof(int));
+    /* Queue storage is not touched by DMA/ISR, so keep it in PSRAM.  The
+     * WakeNet/AEC stack leaves only a few KiB of internal RAM at this point. */
+    s_enc.queue = xQueueCreateWithCaps(
+        AEC_OPUS_MAX_FRAMES, sizeof(int), MALLOC_CAP_SPIRAM);
     s_enc.done_sem = xSemaphoreCreateBinary();
     if (s_enc.queue && s_enc.done_sem) {
         TaskHandle_t enc_handle = NULL;
@@ -618,10 +723,10 @@ static void i2s_aec_demo(void *args)
         ESP_LOGE(TAG, "[aec] failed to create opus enc queue/sem, encoding disabled");
     }
 
-    ESP_LOGI(TAG, "[aec] demo ready: press BTN1 to record (AEC OFF, raw mic); VAD trailing-silence stops REC; async opus encode during REC -> decode -> playback; BTN1 during wait-enc/decode/playback aborts it");
+    ESP_LOGI(TAG, "[aec] demo ready: press BTN1 to record (AEC OFF, raw mic); VAD stops REC; captured PCM uploads by WebSocket; local playback disabled");
 
 
-    int state = 0; /* 0=IDLE, 1=REC, 2=WAIT_ENC, 3=DECODE, 4=PLAY */
+    ai_mirror_audio_state_t state = AUDIO_STATE_IDLE;
     size_t rec_samples = 0;
     uint32_t frame_cnt = 0;
     uint32_t idle_cnt = 0;
@@ -631,6 +736,24 @@ static void i2s_aec_demo(void *args)
     int64_t enc_start_us = 0;      /* encode start timestamp (pushed end-marker); for enc timing */
     bool btn_prev = false;         /* BTN1 level last frame (press-edge trigger) */
     bool wake_triggered = false;   /* set by wakenet in IDLE, consumed as a REC trigger */
+    ai_mirror_playback_request_t playback = {0};
+    bool session_active = false;
+    bool gateway_stream_active = false;
+    bool gateway_stream_failed = false;
+    char session_id[40] = {0};
+    uint32_t session_turn_index = 0;
+    int64_t session_deadline_us = 0;
+    int64_t reply_deadline_us = 0;
+    int64_t session_guard_until_us = 0;
+    uint32_t session_vad_speech_run = 0;
+    uint64_t session_vad_level_sum = 0;
+    uint64_t session_guard_level_sum = 0;
+    uint32_t session_guard_level_frames = 0;
+    uint32_t session_speech_level = AEC_SESSION_MIN_LEVEL;
+    ai_mirror_preroll_t session_preroll = {
+        .samples = session_preroll_buf,
+        .capacity = AEC_SESSION_PREROLL_SAMPLES,
+    };
 
     /* VAD + OPUS state. opus encode counters live in s_enc (written by
      * opus_enc_task); opus_off is maintained by this recorder task. */
@@ -646,19 +769,93 @@ static void i2s_aec_demo(void *args)
         bool btn_now = board_button_is_pressed(BOARD_BUTTON_ID_1);
         bool btn_press_edge = btn_now && !btn_prev;
 
+        bool can_take_end_conversation =
+            !session_active || state == AUDIO_STATE_WAIT_REPLY ||
+            state == AUDIO_STATE_SESSION_LISTEN;
+        if (can_take_end_conversation &&
+            ai_mirror_gateway_take_end_conversation()) {
+            if (session_active) {
+                ESP_LOGI(TAG, "[session] voice exit command received");
+                ai_mirror_gateway_report_session(
+                    session_id, "conversation_session_voice_ended",
+                    session_turn_index);
+                aec_session_end_feedback(tx_handle, rx_handle, chime_buf);
+                (void)ai_mirror_gateway_take_continue_listening();
+                session_active = false;
+                session_id[0] = '\0';
+                state = AUDIO_STATE_IDLE;
+                idle_cnt = 0;
+                vad_len = 0;
+                vad_heard_speech = false;
+                vad_silence_run = 0;
+                session_vad_speech_run = 0;
+                session_vad_level_sum = 0;
+                session_guard_level_sum = 0;
+                session_guard_level_frames = 0;
+                aec_preroll_reset(&session_preroll);
+                wn_ring_len = 0;
+                wake_triggered = false;
+                btn_prev = btn_now;
+                ESP_LOGI(TAG,
+                         "[session] voice exit completed; wake-word mode active");
+                continue;
+            }
+            ESP_LOGW(TAG, "[session] ignored stale end-conversation command");
+        }
+
+        /* A playback response must take priority over a stale continue-listening
+         * command. SESSION_LISTEN is included so a delayed response cannot wait
+         * for the 60-second session timeout before it starts playing. */
+        if ((state == AUDIO_STATE_IDLE || state == AUDIO_STATE_WAIT_REPLY ||
+             state == AUDIO_STATE_SESSION_LISTEN) &&
+            ai_mirror_audio_playback_take(&playback)) {
+            play_gain = 1.0f;
+            state = AUDIO_STATE_PLAYBACK;
+        }
+
+        if (state == AUDIO_STATE_WAIT_REPLY && session_active &&
+            ai_mirror_gateway_take_continue_listening()) {
+            state = AUDIO_STATE_SESSION_LISTEN;
+            session_guard_until_us = esp_timer_get_time() +
+                                     (int64_t)AEC_SESSION_GUARD_MS * 1000;
+            session_deadline_us = esp_timer_get_time() +
+                                  (int64_t)AEC_SESSION_TIMEOUT_MS * 1000;
+            vad_len = 0;
+            vad_heard_speech = false;
+            vad_silence_run = 0;
+            session_vad_speech_run = 0;
+            session_vad_level_sum = 0;
+            session_guard_level_sum = 0;
+            session_guard_level_frames = 0;
+            session_speech_level = AEC_SESSION_MIN_LEVEL;
+            aec_preroll_reset(&session_preroll);
+            ESP_LOGI(TAG, "[session] empty/noisy turn ignored; listening resumed");
+        }
+
         /* ---- PLAYBACK: play peak-normalized OPUS-decoded audio, then go idle.
          * BTN1 or wake word aborts playback instantly, drops the recording and goes
          * straight back to REC. While playing, mic is captured and fed through AEC
          * to remove the playback echo, then to WakeNet for hands-free interruption. ---- */
-        if (state == 4) {
-            ESP_LOGI(TAG, "[aec] playback start, %u samples (%u ms) gain=x%.2f",
-                     (unsigned)s_enc.decode_samples,
-                     (unsigned)(s_enc.decode_samples * 1000U / AI_MIRROR_SAMPLE_RATE),
+        if (state == AUDIO_STATE_PLAYBACK) {
+            ESP_LOGI(TAG, "[aec] LLM playback start, turn=%s %u samples (%u ms)%s",
+                     playback.turn_id,
+                     (unsigned)playback.sample_count,
+                     (unsigned)(playback.sample_count * 1000U / AI_MIRROR_SAMPLE_RATE),
+                     playback.streaming ? " [streaming]" : "");
+            int64_t playback_started_us = esp_timer_get_time();
+            ai_mirror_gateway_report_playback(
+                playback.command_id, "playback_started", 0, "");
+            ESP_LOGI(TAG, "[aec] LLM playback gain=x%.2f",
                      (double)play_gain);
             size_t played = 0;
             bool aborted = false;
+            bool wake_word_aborted = false;
+            bool failed = false;
+            ai_mirror_playback_chunk_t stream_chunk = {0};
+            size_t stream_chunk_offset = 0;
+            bool stream_chunk_valid = false;
             wn_ring_len = 0;  /* reset wakenet ring so leftover IDLE audio doesn't trigger */
-            while (played < s_enc.decode_samples) {
+            while (playback.streaming || played < playback.sample_count) {
                 /* Poll BTN1 every frame (~16ms) so playback can be interrupted */
                 if (board_button_is_pressed(BOARD_BUTTON_ID_1)) {
                     ESP_LOGI(TAG, "[aec] playback aborted by BTN1, discarding recording");
@@ -666,12 +863,37 @@ static void i2s_aec_demo(void *args)
                     break;
                 }
                 size_t n = AEC_FRAME_SAMPLES;
-                if (played + n > s_enc.decode_samples) {
-                    n = s_enc.decode_samples - played;
+                bool have_samples = true;
+                if (playback.streaming) {
+                    if (!stream_chunk_valid || stream_chunk_offset >= stream_chunk.sample_count) {
+                        if (stream_chunk_valid) {
+                            ai_mirror_audio_playback_stream_release_chunk(&stream_chunk);
+                        }
+                        stream_chunk_offset = 0;
+                        stream_chunk_valid = ai_mirror_audio_playback_stream_take_chunk(&stream_chunk);
+                    }
+                    if (!stream_chunk_valid) {
+                        if (ai_mirror_audio_playback_stream_end_received() ||
+                            ai_mirror_audio_playback_stream_has_error()) {
+                            break;
+                        }
+                        /* Keep I2S/AEC alive while the next network frame is in flight. */
+                        have_samples = false;
+                    } else if (stream_chunk_offset + n > stream_chunk.sample_count) {
+                        n = stream_chunk.sample_count - stream_chunk_offset;
+                    }
+                } else if (played + n > playback.sample_count) {
+                    n = playback.sample_count - played;
                 }
                 /* Build stereo playback frame */
                 for (size_t j = 0; j < n; j++) {
-                    float fv = (float)decode_buf[played + j] * play_gain;
+                    int16_t source_sample = 0;
+                    if (have_samples) {
+                        source_sample = playback.streaming
+                            ? stream_chunk.samples[stream_chunk_offset + j]
+                            : playback.samples[played + j];
+                    }
+                    float fv = (float)source_sample * play_gain;
                     if (fv > 32767.0f) {
                         fv = 32767.0f;
                     }
@@ -695,6 +917,7 @@ static void i2s_aec_demo(void *args)
                 esp_err_t ret = i2s_channel_write(tx_handle, play_ster, AEC_FRAME_BYTES, &bw, 1000);
                 if (ret != ESP_OK) {
                     ESP_LOGE(TAG, "[aec] playback write failed: %s", esp_err_to_name(ret));
+                    failed = true;
                     break;
                 }
                 /* Read mic during playback for wake-word detection */
@@ -730,6 +953,7 @@ static void i2s_aec_demo(void *args)
                                 if (wr == WAKENET_DETECTED) {
                                     ESP_LOGI(TAG, "[wn] wake word detected during playback, aborting playback");
                                     aborted = true;
+                                    wake_word_aborted = true;
                                     break;
                                 }
                                 memmove(wn_ring, wn_ring + wn_chunksize,
@@ -742,10 +966,21 @@ static void i2s_aec_demo(void *args)
                         }
                     }
                 }
-                played += n;
+                if (have_samples) {
+                    played += n;
+                    if (playback.streaming) {
+                        stream_chunk_offset += n;
+                    }
+                }
                 if (aborted) {
                     break;
                 }
+            }
+            if (stream_chunk_valid) {
+                ai_mirror_audio_playback_stream_release_chunk(&stream_chunk);
+            }
+            if (playback.streaming && ai_mirror_audio_playback_stream_has_error()) {
+                failed = true;
             }
             if (aborted) {
                 /* Flush queued playback samples so the speaker goes silent NOW,
@@ -755,7 +990,38 @@ static void i2s_aec_demo(void *args)
                 if (s_enc.queue) { xQueueReset(s_enc.queue); }
                 if (s_enc.done_sem) { xSemaphoreTake(s_enc.done_sem, 0); } /* clear stale done */
                 wn_ring_len = 0;  /* clear wakenet ring after playback abort */
-                state = 1;
+                uint32_t playback_ms = (uint32_t)((esp_timer_get_time() - playback_started_us) / 1000);
+                ai_mirror_gateway_report_playback(
+                    playback.command_id, "playback_aborted", playback_ms, "interrupted by user");
+                ai_mirror_audio_playback_stream_abort();
+                ai_mirror_audio_playback_release(&playback);
+
+                /* A wake word during a long-chat answer starts a fresh
+                 * conversation, rather than appending the next utterance to
+                 * the interrupted turn. BTN1 keeps the existing same-session
+                 * recording behavior. */
+                if (wake_word_aborted && session_active) {
+                    ai_mirror_gateway_report_session(
+                        session_id, "conversation_session_ended", session_turn_index);
+                    session_active = false;
+                    session_id[0] = '\0';
+                    session_turn_index = 0;
+                    session_vad_speech_run = 0;
+                    session_vad_level_sum = 0;
+                    session_guard_level_sum = 0;
+                    session_guard_level_frames = 0;
+                    session_speech_level = AEC_SESSION_MIN_LEVEL;
+                    aec_preroll_reset(&session_preroll);
+                    snprintf(session_id, sizeof(session_id), "%08" PRIx32 "%08" PRIx32,
+                             esp_random(), esp_random());
+                    session_active = true;
+                    session_turn_index = 0;
+                    ai_mirror_gateway_report_session(
+                        session_id, "conversation_session_started", session_turn_index);
+                    ESP_LOGI(TAG, "[session] wake word interrupted playback, restarted conversation id=%s",
+                             session_id);
+                }
+                state = AUDIO_STATE_RECORDING;
                 rec_samples = 0;
                 frame_cnt = 0;
                 opus_off = 0;
@@ -770,10 +1036,40 @@ static void i2s_aec_demo(void *args)
                 rec_start_us = esp_timer_get_time();
                 continue;
             }
-            ESP_LOGI(TAG, "[aec] playback done, %u samples", (unsigned)played);
-            /* OPUS was already batch-encoded before playback; go back to IDLE. */
+            uint32_t playback_ms = (uint32_t)((esp_timer_get_time() - playback_started_us) / 1000);
+            if (failed) {
+                ai_mirror_gateway_report_playback(
+                    playback.command_id, "playback_failed", playback_ms, "I2S write failed");
+            } else {
+                ai_mirror_gateway_report_playback(
+                    playback.command_id, "playback_completed", playback_ms, "");
+            }
+            ESP_LOGI(TAG, "[aec] LLM playback %s, %u samples %ums",
+                     failed ? "failed" : "done", (unsigned)played, (unsigned)playback_ms);
+            ai_mirror_audio_playback_release(&playback);
             wn_ring_len = 0;  /* clear wakenet ring for clean IDLE re-entry */
-            state = 0;
+            if (session_active) {
+                state = AUDIO_STATE_SESSION_LISTEN;
+                session_guard_until_us = esp_timer_get_time() +
+                                         (int64_t)AEC_SESSION_GUARD_MS * 1000;
+                session_deadline_us = esp_timer_get_time() +
+                                      (int64_t)AEC_SESSION_TIMEOUT_MS * 1000;
+                vad_len = 0;
+                vad_heard_speech = false;
+                vad_silence_run = 0;
+                session_vad_speech_run = 0;
+                session_vad_level_sum = 0;
+                session_guard_level_sum = 0;
+                session_guard_level_frames = 0;
+                session_speech_level = AEC_SESSION_MIN_LEVEL;
+                aec_preroll_reset(&session_preroll);
+                ai_mirror_gateway_report_session(
+                    session_id, "conversation_listening", session_turn_index);
+                ESP_LOGI(TAG, "[session] listening for follow-up, timeout=%ums",
+                         (unsigned)AEC_SESSION_TIMEOUT_MS);
+            } else {
+                state = AUDIO_STATE_IDLE;
+            }
             idle_cnt = 0;
             continue;
         }
@@ -796,7 +1092,7 @@ static void i2s_aec_demo(void *args)
             mic_mono[j] = mic_ster[2 * j];
         }
 
-        if (state == 1) { /* REC: AEC OFF, store raw mic + feed VAD + push opus frames to enc task */
+        if (state == AUDIO_STATE_RECORDING) { /* REC: AEC OFF, store raw mic + feed VAD + push opus frames to enc task */
             frame_start_us = esp_timer_get_time();
 
             /* VAD on raw mic (AEC disabled): downsample mic_mono (16k/256s) to 8k
@@ -843,6 +1139,11 @@ static void i2s_aec_demo(void *args)
             size_t n = (AEC_FRAME_SAMPLES < room) ? AEC_FRAME_SAMPLES : room;
             memcpy(rec_buf + rec_samples, mic_mono, n * sizeof(int16_t));
             rec_samples += n;
+            if (gateway_stream_active && !gateway_stream_failed &&
+                ai_mirror_gateway_stream_write(mic_mono, n) != ESP_OK) {
+                ESP_LOGW(TAG, "[gateway] streaming upload failed; falling back to turn upload");
+                gateway_stream_failed = true;
+            }
 
             /* push complete 20ms (320-sample) opus frames to the async encoder task */
             while (rec_samples - opus_off >= OPUS_FRAME_SAMPLES && opus_off + OPUS_FRAME_SAMPLES <= AEC_REC_BUF_SAMPLES) {
@@ -870,20 +1171,36 @@ static void i2s_aec_demo(void *args)
                          vad_end ? "vad-silence" : "buf-full",
                          (unsigned)rec_samples,
                          (unsigned)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE));
+                session_turn_index++;
+                esp_err_t gateway_err = ESP_OK;
+                if (gateway_stream_active) {
+                    gateway_err = ai_mirror_gateway_stream_end();
+                    gateway_stream_active = false;
+                    gateway_stream_failed = false;
+                }
+                if (gateway_err != ESP_OK) {
+                    gateway_err = ai_mirror_gateway_submit_turn_pcm(
+                        rec_buf,
+                        rec_samples,
+                        AI_MIRROR_SAMPLE_RATE,
+                        session_id,
+                        session_turn_index);
+                }
+                if (gateway_err != ESP_OK) {
+                    ESP_LOGW(TAG, "[gateway] recording upload skipped: %s", esp_err_to_name(gateway_err));
+                }
                 {                     int64_t rec_wall_us = esp_timer_get_time() - rec_start_us;                     uint32_t rec_wall_ms = (uint32_t)(rec_wall_us / 1000);                     uint32_t expected_ms = (uint32_t)(rec_samples * 1000U / AI_MIRROR_SAMPLE_RATE);                     ESP_LOGI(TAG, "[aec] diag: rec wall=%ums expected16k=%ums ratio=%.2f", (unsigned)rec_wall_ms, (unsigned)expected_ms, rec_wall_ms ? (double)expected_ms / (double)rec_wall_ms : 0.0);                 }
-                play_chime(tx_handle, rx_handle, chime_buf, s_chime_stop,
-                           sizeof(s_chime_stop) / sizeof(s_chime_stop[0]));
-                ESP_LOGI(TAG, "[aec] stop chime done");
                 /* Push end-marker: opus_enc_task finishes the last queued frames,
-                 * then decodes packed -> decode_buf, then signals done. Enter WAIT_ENC. */
+                 * then decodes packed -> decode_buf, then signals done. Enter WAIT_ENC.
+                 * Playback is intentionally disabled; decode remains as an integrity check. */
                 int end_marker = -1;
                 if (s_enc.queue) {
                     xQueueSend(s_enc.queue, &end_marker, portMAX_DELAY);
                 }
                 enc_start_us = esp_timer_get_time();
-                state = 2;
+                state = AUDIO_STATE_WAIT_ENCODING;
             }
-        } else if (state == 0) { /* IDLE: silent, feed wakenet + wait for BTN1 press-edge */
+        } else if (state == AUDIO_STATE_IDLE) { /* IDLE: silent, feed wakenet + wait for BTN1 press-edge */
             idle_cnt++;
             if ((idle_cnt % 375) == 0) {
                 ESP_LOGI(TAG, "[aec] idle (silent), ready - say wake word or press BTN1 to record (stack free=%u)",
@@ -922,11 +1239,26 @@ static void i2s_aec_demo(void *args)
                 }
             }
 
-            if (btn_press_edge || wake_triggered) {
+            bool gateway_record_requested = ai_mirror_gateway_take_record_request();
+            if (btn_press_edge || wake_triggered || gateway_record_requested) {
                 if (wake_triggered) {
                     ESP_LOGI(TAG, "[wn] wake word detected, starting recording");
+                } else if (gateway_record_requested) {
+                    ESP_LOGI(TAG, "[gateway] remote start-recording command accepted");
                 }
-                state = 1;
+                snprintf(session_id, sizeof(session_id), "%08" PRIx32 "%08" PRIx32,
+                         esp_random(), esp_random());
+                session_active = true;
+                session_turn_index = 0;
+                ai_mirror_gateway_report_session(
+                    session_id, "conversation_session_started", 0);
+                gateway_stream_active =
+                    ai_mirror_gateway_stream_begin(
+                        session_id, AI_MIRROR_SAMPLE_RATE,
+                        session_turn_index + 1) == ESP_OK;
+                gateway_stream_failed = false;
+                ESP_LOGI(TAG, "[session] started id=%s", session_id);
+                state = AUDIO_STATE_RECORDING;
                 rec_samples = 0;
                 frame_cnt = 0;
                 opus_off = 0;
@@ -944,19 +1276,262 @@ static void i2s_aec_demo(void *args)
                 /* reset wakenet ring buffer. NOTE: wn_iface->clean() is NOT called - it
                  * dereferences a NULL conv-queue buffer (a model buffer failed to allocate
                  * under internal-RAM heap fragmentation); detect's streaming state
-                 * self-refreshes, and only IDLE feeds wakenet so playback can't re-trigger. */
+                 * self-refreshes, and IDLE/SESSION_LISTEN feed wakenet only when
+                 * the device is not recording or playing. */
                 wake_triggered = false;
                 wn_ring_len = 0;
                 ESP_LOGI(TAG, "[aec] recording start (AEC off, raw mic) - VAD will stop");
                 aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
                 rec_start_us = esp_timer_get_time();
             }
-        } else if (state == 2) { /* WAIT_ENC: wait for async opus_enc_task to finish encode+decode, then PLAY. BTN1 aborts -> REC. */
+        } else if (state == AUDIO_STATE_SESSION_LISTEN) {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us >= session_deadline_us) {
+                ESP_LOGI(TAG, "[session] idle timeout, returning to wake-word mode");
+                ai_mirror_gateway_report_session(
+                    session_id, "conversation_session_ended", session_turn_index);
+                aec_session_end_feedback(tx_handle, rx_handle, chime_buf);
+                session_active = false;
+                session_id[0] = '\0';
+                state = AUDIO_STATE_IDLE;
+                idle_cnt = 0;
+                vad_len = 0;
+                session_vad_speech_run = 0;
+                session_vad_level_sum = 0;
+                aec_preroll_reset(&session_preroll);
+                wn_ring_len = 0;
+            } else if (now_us < session_guard_until_us) {
+                session_guard_level_sum +=
+                    aec_mean_abs(mic_mono, AEC_FRAME_SAMPLES);
+                session_guard_level_frames++;
+            } else {
+                bool wake_word_detected = false;
+                if (session_guard_level_frames > 0) {
+                    uint32_t noise_level = (uint32_t)(
+                        session_guard_level_sum / session_guard_level_frames);
+                    uint32_t dynamic_level =
+                        noise_level * AEC_SESSION_NOISE_MULTIPLIER;
+                    if (dynamic_level < AEC_SESSION_MIN_LEVEL) {
+                        dynamic_level = AEC_SESSION_MIN_LEVEL;
+                    }
+                    if (dynamic_level > AEC_SESSION_MAX_DYNAMIC_LEVEL) {
+                        dynamic_level = AEC_SESSION_MAX_DYNAMIC_LEVEL;
+                    }
+                    session_speech_level = dynamic_level;
+                    ESP_LOGI(TAG,
+                             "[session] noise=%u speech-level=%u guard=%ums",
+                             (unsigned)noise_level,
+                             (unsigned)session_speech_level,
+                             (unsigned)AEC_SESSION_GUARD_MS);
+                    session_guard_level_frames = 0;
+                }
+
+                /* Keep WakeNet active during long-chat listening. A detected
+                 * wake word ends the current session and starts a fresh one,
+                 * matching the normal IDLE wake-word path. */
+                if (wn_iface && wn_model && wn_ring) {
+                    int copied = 0;
+                    while (copied < AEC_FRAME_SAMPLES) {
+                        int space = wn_chunksize - wn_ring_len;
+                        int n = AEC_FRAME_SAMPLES - copied;
+                        if (n > space) {
+                            n = space;
+                        }
+                        memcpy(wn_ring + wn_ring_len,
+                               mic_mono + copied,
+                               n * sizeof(int16_t));
+                        wn_ring_len += n;
+                        copied += n;
+                        while (wn_ring_len >= wn_chunksize) {
+                            wakenet_state_t wr = wn_iface->detect(wn_model, wn_ring);
+                            if (wr == WAKENET_DETECTED) {
+                                wake_word_detected = true;
+                                break;
+                            }
+                            memmove(wn_ring,
+                                    wn_ring + wn_chunksize,
+                                    (wn_ring_len - wn_chunksize) * sizeof(int16_t));
+                            wn_ring_len -= wn_chunksize;
+                        }
+                        if (wake_word_detected) {
+                            break;
+                        }
+                    }
+                }
+
+                if (wake_word_detected) {
+                    ESP_LOGI(TAG,
+                             "[session] wake word detected, restarting conversation");
+                    ai_mirror_gateway_report_session(
+                        session_id, "conversation_session_ended", session_turn_index);
+                    session_active = false;
+                    session_id[0] = '\0';
+                    session_turn_index = 0;
+                    session_vad_speech_run = 0;
+                    session_vad_level_sum = 0;
+                    session_guard_level_sum = 0;
+                    session_guard_level_frames = 0;
+                    aec_preroll_reset(&session_preroll);
+                    wn_ring_len = 0;
+
+                    snprintf(session_id, sizeof(session_id), "%08" PRIx32 "%08" PRIx32,
+                             esp_random(), esp_random());
+                    session_active = true;
+                    session_turn_index = 0;
+                    ai_mirror_gateway_report_session(
+                        session_id, "conversation_session_started", 0);
+                    ESP_LOGI(TAG, "[session] restarted id=%s", session_id);
+
+                    gateway_stream_active =
+                        ai_mirror_gateway_stream_begin(
+                            session_id, AI_MIRROR_SAMPLE_RATE,
+                            session_turn_index + 1) == ESP_OK;
+                    gateway_stream_failed = false;
+                    state = AUDIO_STATE_RECORDING;
+                    rec_samples = 0;
+                    frame_cnt = 0;
+                    opus_off = 0;
+                    vad_len = 0;
+                    vad_heard_speech = false;
+                    vad_speech_cnt = 0;
+                    vad_silence_cnt = 0;
+                    vad_silence_run = 0;
+                    s_enc.packed_len = 0;
+                    s_enc.frame_cnt = 0;
+                    s_enc.total_bytes = 0;
+                    s_enc.drop_tail = false;
+                    if (s_enc.queue) {
+                        xQueueReset(s_enc.queue);
+                    }
+                    if (s_enc.done_sem) {
+                        xSemaphoreTake(s_enc.done_sem, 0);
+                    }
+                    wake_triggered = false;
+                    aec_rec_start_feedback(
+                        tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
+                    rec_start_us = esp_timer_get_time();
+                    continue;
+                }
+
+                aec_preroll_push(
+                    &session_preroll, mic_mono, AEC_FRAME_SAMPLES);
+                bool speech_triggered = false;
+                uint32_t mic_level =
+                    aec_mean_abs(mic_mono, AEC_FRAME_SAMPLES);
+                const int ds_n = AEC_FRAME_SAMPLES / 2;
+                for (int j = 0; j < ds_n; j++) {
+                    ds_buf[j] = (int16_t)(((int32_t)mic_mono[2 * j] +
+                                           (int32_t)mic_mono[2 * j + 1]) >> 1);
+                }
+                int copied = 0;
+                while (copied < ds_n && !speech_triggered) {
+                    int space = VAD_BUF_SAMPLES - vad_len;
+                    int n = ds_n - copied;
+                    if (n > space) {
+                        n = space;
+                    }
+                    memcpy(vad_buf + vad_len, ds_buf + copied,
+                           n * sizeof(int16_t));
+                    vad_len += n;
+                    copied += n;
+                    while (vad_len >= VAD_FRAME_SAMPLES) {
+                        vad_state_t vst = vad_process(
+                            vad, vad_buf, VAD_SAMPLE_RATE_HZ, VAD_FRAME_MS);
+                        memmove(vad_buf,
+                                vad_buf + VAD_FRAME_SAMPLES,
+                                (vad_len - VAD_FRAME_SAMPLES) * sizeof(int16_t));
+                        vad_len -= VAD_FRAME_SAMPLES;
+                        if (vst == VAD_SPEECH) {
+                            session_vad_speech_run++;
+                            session_vad_level_sum += mic_level;
+                            if (session_vad_speech_run >=
+                                AEC_SESSION_VAD_RUN_FRAMES) {
+                                uint32_t speech_level = (uint32_t)(
+                                    session_vad_level_sum /
+                                    session_vad_speech_run);
+                                if (speech_level >= session_speech_level) {
+                                    ESP_LOGI(
+                                        TAG,
+                                        "[session] speech avg=%u threshold=%u",
+                                        (unsigned)speech_level,
+                                        (unsigned)session_speech_level);
+                                    speech_triggered = true;
+                                    break;
+                                }
+                                session_vad_speech_run = 0;
+                                session_vad_level_sum = 0;
+                            }
+                        } else {
+                            session_vad_speech_run = 0;
+                            session_vad_level_sum = 0;
+                        }
+                    }
+                }
+
+                bool gateway_record_requested =
+                    ai_mirror_gateway_take_record_request();
+                if (speech_triggered || btn_press_edge || gateway_record_requested) {
+                    rec_samples = aec_preroll_copy(
+                        &session_preroll, rec_buf, AEC_REC_BUF_SAMPLES);
+                    frame_cnt = 0;
+                    opus_off = 0;
+                    vad_heard_speech = speech_triggered;
+                    vad_speech_cnt = speech_triggered ? 1 : 0;
+                    vad_silence_cnt = 0;
+                    vad_silence_run = 0;
+                    vad_len = 0;
+                    session_vad_speech_run = 0;
+                    session_vad_level_sum = 0;
+                    s_enc.packed_len = 0;
+                    s_enc.frame_cnt = 0;
+                    s_enc.total_bytes = 0;
+                    s_enc.drop_tail = false;
+                    if (s_enc.queue) {
+                        xQueueReset(s_enc.queue);
+                    }
+                    if (s_enc.done_sem) {
+                        xSemaphoreTake(s_enc.done_sem, 0);
+                    }
+                    state = AUDIO_STATE_RECORDING;
+                    gateway_stream_active =
+                        ai_mirror_gateway_stream_begin(
+                            session_id, AI_MIRROR_SAMPLE_RATE,
+                            session_turn_index + 1) == ESP_OK;
+                    gateway_stream_failed = false;
+                    if (gateway_stream_active && rec_samples > 0 &&
+                        ai_mirror_gateway_stream_write(rec_buf, rec_samples) != ESP_OK) {
+                        ESP_LOGW(TAG, "[gateway] preroll stream upload failed; using turn fallback");
+                        gateway_stream_failed = true;
+                    }
+                    rec_start_us = esp_timer_get_time() -
+                                   (int64_t)rec_samples * 1000000 /
+                                       AI_MIRROR_SAMPLE_RATE;
+                    ESP_LOGI(TAG,
+                             "[session] follow-up detected, preroll=%ums turn=%u",
+                             (unsigned)(rec_samples * 1000U /
+                                        AI_MIRROR_SAMPLE_RATE),
+                             (unsigned)(session_turn_index + 1));
+                    aec_preroll_reset(&session_preroll);
+                }
+            }
+        } else if (state == AUDIO_STATE_WAIT_REPLY) {
+            if (esp_timer_get_time() >= reply_deadline_us) {
+                ESP_LOGW(TAG, "[session] reply timeout, ending session");
+                ai_mirror_gateway_report_session(
+                    session_id, "conversation_session_reply_timeout",
+                    session_turn_index);
+                aec_session_end_feedback(tx_handle, rx_handle, chime_buf);
+                session_active = false;
+                session_id[0] = '\0';
+                state = AUDIO_STATE_IDLE;
+                idle_cnt = 0;
+            }
+        } else if (state == AUDIO_STATE_WAIT_ENCODING) { /* WAIT_ENC: wait for async Opus encode/decode integrity check. */
             if (btn_now) {
                 ESP_LOGI(TAG, "[aec] wait-enc aborted by BTN1, discarding recording");
                 if (s_enc.queue) { xQueueReset(s_enc.queue); }
                 if (s_enc.done_sem) { xSemaphoreTake(s_enc.done_sem, 0); } /* clear stale done */
-                state = 1;
+                state = AUDIO_STATE_RECORDING;
                 rec_samples = 0;
                 frame_cnt = 0;
                 opus_off = 0;
@@ -969,22 +1544,22 @@ static void i2s_aec_demo(void *args)
                 aec_rec_start_feedback(tx_handle, rx_handle, ref_ster, mic_ster, chime_buf);
                 rec_start_us = esp_timer_get_time();
             } else if (!s_enc.queue || !s_enc.done_sem || xSemaphoreTake(s_enc.done_sem, 0) == pdPASS) {
-                /* encode + decode complete (or no encoder): compute play_gain from decode_peak, then PLAY */
+                /* Encode + decode complete (or no encoder). Do not play the captured audio. */
                 int64_t now_us = esp_timer_get_time();
                 uint32_t enc_ms = (uint32_t)((s_enc.enc_done_us - enc_start_us) / 1000);
                 uint32_t dec_ms = (uint32_t)((now_us - s_enc.enc_done_us) / 1000);
-                play_gain = 24000.0f / (float)s_enc.decode_peak;
-                if (play_gain > 8.0f) {
-                    play_gain = 8.0f;
-                }
-                ESP_LOGI(TAG, "[aec] opus enc+dec done: %u frames %u bytes, dec=%u samples peak=%d gain=x%.2f (enc=%ums dec=%ums)",
+                ESP_LOGI(TAG, "[aec] opus enc+dec done: %u frames %u bytes, dec=%u samples peak=%d (enc=%ums dec=%ums); playback disabled",
                          (unsigned)s_enc.frame_cnt, (unsigned)s_enc.total_bytes,
-                         (unsigned)s_enc.decode_samples, (int)s_enc.decode_peak, (double)play_gain,
+                         (unsigned)s_enc.decode_samples, (int)s_enc.decode_peak,
                          (unsigned)enc_ms, (unsigned)dec_ms);
-                state = 4;
+                state = session_active ? AUDIO_STATE_WAIT_REPLY : AUDIO_STATE_IDLE;
+                reply_deadline_us = esp_timer_get_time() +
+                                    (int64_t)AEC_REPLY_TIMEOUT_MS * 1000;
+                idle_cnt = 0;
+                wn_ring_len = 0;
             } else {
                 /* still encoding/decoding: yield CPU to opus_enc_task */
-                vTaskDelay(pdMS_TO_TICKS(1));
+                vTaskDelay(pdMS_TO_TICKS(OPUS_TASK_YIELD_MS));
             }
         }
         btn_prev = btn_now;
@@ -1207,6 +1782,10 @@ static bool run_provisioning_flow(lv_disp_t *disp)
 static bool ai_mirror_audio_init(void)
 {
     bool audio_ok = true;
+    if (ai_mirror_audio_playback_init() != ESP_OK) {
+        ESP_LOGE(TAG, "playback queue init failed, skip audio");
+        return false;
+    }
     if (i2s_driver_init() != ESP_OK) {
         ESP_LOGE(TAG, "i2s driver init failed, skip audio");
         audio_ok = false;
@@ -1238,7 +1817,9 @@ static void ai_mirror_audio_start(bool audio_ok)
         ESP_LOGI(TAG, "Start AEC demo");
         ESP_LOGI(TAG, "[aec] internal free heap before xTaskCreate: %u bytes",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-        BaseType_t xret = xTaskCreate(i2s_aec_demo, "aec_demo", 16384, NULL, 5, NULL);
+        BaseType_t xret = xTaskCreatePinnedToCoreWithCaps(
+            i2s_aec_demo, "aec_demo", 3584, NULL, 5, NULL, 1,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (xret != pdPASS) {
             ESP_LOGE(TAG, "[aec] xTaskCreate FAILED (ret=%d), task not started", (int)xret);
         } else {
@@ -1400,6 +1981,10 @@ void app_main(void)
         lvgl_port_lock(0);
         ai_mirror_ui_show_face_demo(disp);
         lvgl_port_unlock();
+        esp_err_t gateway_err = ai_mirror_gateway_start();
+        if (gateway_err != ESP_OK) {
+            ESP_LOGW(TAG, "[gateway] client not started: %s", esp_err_to_name(gateway_err));
+        }
     }
 
     ai_mirror_audio_start(audio_ok);

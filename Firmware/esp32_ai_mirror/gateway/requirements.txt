@@ -1,0 +1,8 @@
+# PyTorch is intentionally not pinned here: install the CPU or CUDA build that
+# matches the gateway machine, then install these runtime dependencies.
+funasr==1.3.29
+modelscope>=1.20,<2
+# 0.2.x can crash at import time with the transformers version bundled in
+# the project's existing Anaconda runtime on Windows.
+sentencepiece==0.1.99
+edge-tts==7.2.8

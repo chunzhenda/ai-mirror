@@ -1,0 +1,141 @@
+2026-08-02 16:03:56,217 [INFO] download models from model hub: ms
+2026-08-02 16:03:57,160 - modelscope - WARNING - Using branch: master as version is unstable, use with caution
+2026-08-02 16:03:57,303 [WARNING] trust_remote_code: True
+2026-08-02 16:03:59,011 [INFO] Loading pretrained params from C:\Users\86176\.cache\modelscope\hub\iic\SenseVoiceSmall\model.pt
+2026-08-02 16:03:59,024 [INFO] ckpt: C:\Users\86176\.cache\modelscope\hub\iic\SenseVoiceSmall\model.pt
+2026-08-02 16:04:00,170 [INFO] scope_map: ['module.', 'None']
+2026-08-02 16:04:00,172 [INFO] excludes: None
+2026-08-02 16:04:00,310 [INFO] Loading ckpt: C:\Users\86176\.cache\modelscope\hub\iic\SenseVoiceSmall\model.pt, status: <All keys matched successfully>
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 55287)
+Traceback (most recent call last):
+  File "E:\python\amaconda3\Lib\socketserver.py", line 691, in process_request_thread
+    self.finish_request(request, client_address)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 361, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 755, in __init__
+    self.handle()
+  File "E:\python\amaconda3\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+  File "E:\python\amaconda3\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\python\amaconda3\Lib\socket.py", line 706, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] \u8fdc程主机\u5f3a迫\u5173\u95ed了一个\u73b0有的\u8fde接。
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 53075)
+Traceback (most recent call last):
+  File "E:\python\amaconda3\Lib\socketserver.py", line 691, in process_request_thread
+    self.finish_request(request, client_address)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 361, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 755, in __init__
+    self.handle()
+  File "E:\python\amaconda3\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+  File "E:\python\amaconda3\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\python\amaconda3\Lib\socket.py", line 706, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] \u8fdc程主机\u5f3a迫\u5173\u95ed了一个\u73b0有的\u8fde接。
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 62676)
+Traceback (most recent call last):
+  File "E:\python\amaconda3\Lib\socketserver.py", line 691, in process_request_thread
+    self.finish_request(request, client_address)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 361, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 755, in __init__
+    self.handle()
+  File "E:\python\amaconda3\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+  File "E:\python\amaconda3\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\python\amaconda3\Lib\socket.py", line 706, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] \u8fdc程主机\u5f3a迫\u5173\u95ed了一个\u73b0有的\u8fde接。
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 52102)
+Traceback (most recent call last):
+  File "E:\python\amaconda3\Lib\socketserver.py", line 691, in process_request_thread
+    self.finish_request(request, client_address)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 361, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 755, in __init__
+    self.handle()
+  File "E:\python\amaconda3\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+  File "E:\python\amaconda3\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\python\amaconda3\Lib\socket.py", line 706, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] \u8fdc程主机\u5f3a迫\u5173\u95ed了一个\u73b0有的\u8fde接。
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 57443)
+Traceback (most recent call last):
+  File "E:\python\amaconda3\Lib\socketserver.py", line 691, in process_request_thread
+    self.finish_request(request, client_address)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 361, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 755, in __init__
+    self.handle()
+  File "E:\python\amaconda3\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+  File "E:\python\amaconda3\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\python\amaconda3\Lib\socket.py", line 706, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] \u8fdc程主机\u5f3a迫\u5173\u95ed了一个\u73b0有的\u8fde接。
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 49957)
+Traceback (most recent call last):
+  File "E:\python\amaconda3\Lib\socketserver.py", line 691, in process_request_thread
+    self.finish_request(request, client_address)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 361, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 755, in __init__
+    self.handle()
+  File "E:\python\amaconda3\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+  File "E:\python\amaconda3\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\python\amaconda3\Lib\socket.py", line 706, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] \u8fdc程主机\u5f3a迫\u5173\u95ed了一个\u73b0有的\u8fde接。
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 63404)
+Traceback (most recent call last):
+  File "E:\python\amaconda3\Lib\socketserver.py", line 691, in process_request_thread
+    self.finish_request(request, client_address)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 361, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "E:\python\amaconda3\Lib\socketserver.py", line 755, in __init__
+    self.handle()
+  File "E:\python\amaconda3\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+  File "E:\python\amaconda3\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\python\amaconda3\Lib\socket.py", line 706, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] \u8fdc程主机\u5f3a迫\u5173\u95ed了一个\u73b0有的\u8fde接。
+----------------------------------------
